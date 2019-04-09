@@ -32,7 +32,13 @@ def kl_div(p, q):
     p = np.asarray(p, dtype=np.float)
     q = np.asarray(q, dtype=np.float)
 
-    return np.sum(np.where(p != 0, p * np.log(p / q), 0), axis=-1)
+    kl = np.sum(np.where(p != 0, p * np.log(p / q), 0), axis=-1)
+
+    if not np.isfinite(kl):
+        return np.zeros(kl.shape)
+    
+    return kl
+
 
 
 def agent_name_to_idx(name, self_id):
