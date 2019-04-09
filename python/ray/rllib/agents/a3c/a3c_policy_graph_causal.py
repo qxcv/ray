@@ -34,10 +34,11 @@ def kl_div(p, q):
 
     kl = np.sum(np.where(p != 0, p * np.log(p / q), 0), axis=-1)
 
-    if not np.isfinite(kl):
+    # Don't return nans or infs
+    if np.all(np.isfinite(kl)):
+        return kl
+    else:
         return np.zeros(kl.shape)
-    
-    return kl
 
 
 
