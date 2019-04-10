@@ -41,7 +41,6 @@ def kl_div(p, q):
         return np.zeros(kl.shape)
 
 
-
 def agent_name_to_idx(name, self_id):
     agent_num = int(name[6])
     self_num = int(self_id[6])
@@ -125,6 +124,9 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
         self.influence_reward_weight = cust_opts['influence_reward_weight']
         self.influence_curriculum_steps = cust_opts['influence_curriculum_steps']
         self.influence_only_when_visible = cust_opts['influence_only_when_visible']
+        self.inf_scale_start = cust_opts['influence_scaledown_start']
+        self.inf_scale_end = cust_opts['influence_scaledown_end']
+        self.inf_scale_final_val = cust_opts['influence_scaledown_final_val']
 
         # Use to compute increasing influence curriculum weight
         self.steps_processed = 0
@@ -462,10 +464,22 @@ class A3CPolicyGraph(LearningRateSchedule, TFPolicyGraph):
         return visibility
 
     def current_influence_curriculum_weight(self):
-        if self.steps_processed > self.influence_curriculum_steps:
+        """ Computes multiplier for influence reward based on training steps 
+        taken and curriculum parameters.
+
+        Returns: scalar float influence weight
+        """
+        if self.steps_processed < self.influence_curriculum_steps:
+            percent = float(self.steps_processed) / self.influence_curriculum_steps
+            return percent * self.influence_reward_weight
+        elif self.steps_processed > self.influence_opts['influence_scaledown_start']:
+            percent = (self.steps_processed - self.inf_scale_start) \
+                / float(self.inf_scale_end - self.inf_scale_start)
+            diff = self.influence_reward_weight - self.inf_scale_final_val
+            scaled = self.influence_reward_weight - diff * percent
+            return max(self.inf_scale_final_val, scaled)
+        else:
             return self.influence_reward_weight
-        percent = float(self.steps_processed) / self.influence_curriculum_steps
-        return percent * self.influence_reward_weight
 
     def marginalize_predictions_over_own_actions(self, trajectory):
         # Run policy to get probability of each action in original trajectory
