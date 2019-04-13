@@ -2,16 +2,23 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import logging
+
 from ray.rllib.agents.trainer import with_common_config
 from ray.rllib.agents.dqn.dqn import DQNTrainer
 from ray.rllib.agents.td3.td3_torch_policy_graph import TD3TorchPolicyGraph
+from ray.rllib.evaluation.metrics import collect_metrics
 from ray.rllib.utils.annotations import override
 from ray.rllib.utils.schedules import PiecewiseSchedule, step_interpolation
+
+logger = logging.getLogger(__name__)
 
 # yapf: disable
 # __sphinx_doc_begin__
 DEFAULT_CONFIG = with_common_config({
     # see https://spinningup.openai.com/en/latest/algorithms/td3.html for docs
+
+    # TODO: add architecture options for actor and critic
 
     # TD3 reference impl does not use any of the following things, but base DQN
     # trainer does
@@ -23,14 +30,16 @@ DEFAULT_CONFIG = with_common_config({
     "beta_annealing_fraction": 0.2,
     "final_prioritized_replay_beta": 0.4,
     "schedule_max_timesteps": 0,
-    "compress_observations": False,
-    "evaluation_interval": None,
+    "compress_observations": True,
     "optimizer_class": "SyncReplayOptimizer",
     "min_iter_time_s": 1,
     "per_worker_exploration": False,
     # TO ADD: "num_workers": 0
 
-    "steps_per_epoch": 5000,  # FIXME what does this map to in rllib?
+    "evaluation_interval": 10,
+    "evaluation_num_episodes": 10,
+
+    # "steps_per_epoch": 5000,  # FIXME what does this map to in rllib?
     "sample_batch_size": 5,  # ??? is this the right way to implement steps_per_epoch?
     "timesteps_per_iteration": 5000,  # ??? same here, I think this controls how many env steps we have to wait for before optimising, but I'm not certain
 
@@ -39,7 +48,7 @@ DEFAULT_CONFIG = with_common_config({
     # equivalent to replay_size in Spinning Up
     "buffer_size": 1000000,
 
-    "max_ep_len": 1000,  # FIXME this will be called something else
+    # "max_ep_len": 1000,  # FIXME this will be called something else
 
     "gamma": 0.99,  # FIXME: probably called something else
 
@@ -67,7 +76,9 @@ DEFAULT_CONFIG = with_common_config({
     # we update q-function policy_delay times more often than policy (2x in the
     # TD3 paper)
     "policy_delay": 2,
-    # TODO: add architecture options for actor and critic
+
+    # disable all action noise in compute_actions (good for test rollouts)
+    "test_mode": False,
 })
 # __sphinx_doc_end__
 # yapf: enable
@@ -90,6 +101,17 @@ class TD3Trainer(DQNTrainer):
                                                       update_target())
         self.last_target_update_ts = self.global_timestep
         self.num_target_updates += 1
+
+    def _evaluate(self):
+        logger.info("Evaluating current policy for {} episodes".format(
+            self.config["evaluation_num_episodes"]))
+        self.evaluation_ev.restore(self.local_evaluator.save())
+        self.evaluation_ev.foreach_policy(lambda p, _: p.set_test_mode(True))
+        for _ in range(self.config["evaluation_num_episodes"]):
+            self.evaluation_ev.sample()
+        metrics = collect_metrics(self.evaluation_ev)
+        self.evaluation_ev.foreach_policy(lambda p, _: p.set_test_mode(False))
+        return {"evaluation": metrics}
 
     @override(DQNTrainer)
     def _make_exploration_schedule(self, worker_index):

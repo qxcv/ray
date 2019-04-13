@@ -74,24 +74,26 @@ class TwinQNetwork(nn.Module):
 
 class TD3Loss(nn.Module):
     def __init__(self, policy, q_networks, target_q_networks, target_policy,
-                 noise_clip, max_action, gamma):
+                 target_noise, noise_clip, max_action, gamma):
         super().__init__()
         self.policy = policy
         self.q_networks = q_networks
         self.target_q_networks = target_q_networks
         self.target_policy = target_policy
+        self.target_noise = target_noise
         self.noise_clip = noise_clip
         self.gamma = gamma
         self.max_action = max_action
 
     def forward(self, obs, act, rew, obs_next, dones):
-        act_noise = torch.normal(torch.zeros_like(act), torch.ones_like(act)) \
+        act_noise = torch.normal(torch.zeros_like(act), self.target_noise) \
             .clamp(-self.noise_clip, self.noise_clip)
-        target_acts = (self.target_policy(obs) + act_noise) \
+        target_acts = (self.target_policy(obs_next) + act_noise) \
             .clamp(-self.max_action, self.max_action)
         min_q_next = torch.min(*self.target_q_networks(obs_next, target_acts))
         dones_f = dones.float()
-        targets = (rew + self.gamma * dones_f * min_q_next).detach()
+        targets = rew + self.gamma * (1 - dones_f) * min_q_next
+        targets = targets.detach()
         next_q1, next_q2 = self.q_networks(obs, act)
         q_loss = F.mse_loss(next_q1, targets) + F.mse_loss(next_q2, targets)
         # FIXME: is there some way to prevent policy_loss.backward() from
@@ -121,6 +123,7 @@ class TD3TorchPolicyGraph(TorchPolicyGraph):
                 "other, but lower is %s and upper is %s" %
                 (action_space.low, action_space.high))
         self.config = config
+        self.test_mode = self.config['test_mode']
         self.dim_action, = action_space.shape
         self.dim_state, = observation_space.shape
         # initially we do TOTAL EXPLORATION
@@ -135,8 +138,13 @@ class TD3TorchPolicyGraph(TorchPolicyGraph):
         self.target_q_networks = TwinQNetwork(self.dim_state, self.dim_action)
         self.target_policy = PolicyNetwork(self.dim_state, self.dim_action,
                                            self.max_action)
+        self._copy_weights(self.target_q_networks.parameters(),
+                           self.q_networks.parameters())
+        self._copy_weights(self.target_policy.parameters(),
+                           self.policy.parameters())
         for param in it.chain(self.target_q_networks.parameters(),
                               self.target_policy.parameters()):
+            param.grad = None
             param.requires_grad = False
 
         self.policy_optimizer = torch.optim.Adam(self.policy.parameters(),
@@ -151,6 +159,7 @@ class TD3TorchPolicyGraph(TorchPolicyGraph):
                        q_networks=self.q_networks,
                        target_q_networks=self.target_q_networks,
                        target_policy=self.target_policy,
+                       target_noise=self.config['target_noise'],
                        noise_clip=self.config['target_noise_clip'],
                        gamma=self.config['gamma'],
                        max_action=self.max_action)
@@ -191,14 +200,15 @@ class TD3TorchPolicyGraph(TorchPolicyGraph):
                 ob = torch.from_numpy(np.array(obs_batch)).float()
                 # normally we just compute noisy actions
                 actions = self.policy(ob).detach()
-                action_noise = torch.normal(
-                    torch.zeros_like(actions),
-                    self.config['act_noise'] * torch.ones_like(actions))
+                action_noise = self.config['act_noise'] * torch.normal(
+                    torch.zeros_like(actions), torch.ones_like(actions))
+                if self.test_mode:
+                    action_noise *= 0
                 actions = (actions + action_noise) \
                     .clamp(-self.max_action, self.max_action)
                 # sometimes we also do exploration by re-sampling a subset of
                 # actions at uniform
-                if self.exploration_fraction > 0:
+                if self.exploration_fraction > 0 and not self.test_mode:
                     n_actions = actions.shape[0]
                     eps = self.exploration_fraction
                     rand_mask = np.random.randn(n_actions) < eps
@@ -233,6 +243,7 @@ class TD3TorchPolicyGraph(TorchPolicyGraph):
             # network before computing q loss for real (which will not change
             # policy loss).
             self.policy_optimizer.zero_grad()
+            self.q_optimizer.zero_grad()
             policy_loss.backward()
             self.q_optimizer.zero_grad()
             q_loss.backward()
@@ -257,12 +268,15 @@ class TD3TorchPolicyGraph(TorchPolicyGraph):
 
             # policy update delay (the zero_grad() calls in compute_gradients()
             # should ensure that we don't accumulate gradients accidentally)
-            update_pol = self.config["policy_delay"] == 0 \
-                or self.num_q_updates % self.config["policy_delay"] == 0
-            if update_pol:
+            if self._should_update_pol_and_target:
                 self.policy_optimizer.step()
 
             return {}
+
+    @property
+    def _should_update_pol_and_target(self):
+        return self.config["policy_delay"] == 0 \
+            or self.num_q_updates % self.config["policy_delay"] == 0
 
     @override(TorchPolicyGraph)
     def get_initial_state(self):
@@ -272,15 +286,25 @@ class TD3TorchPolicyGraph(TorchPolicyGraph):
     def set_epsilon(self, eps):
         self.exploration_fraction = eps
 
+    def set_test_mode(self, value):
+        self.test_mode = value
+
+    def _copy_weights(self, current_params, new_params):
+        for current, new in zip(current_params, new_params):
+            current.data[:] = new.data[:]
+
     def _do_target_update(self, current_target_params, new_params):
         polyak = self.config['polyak']
         for current, new in zip(current_target_params, new_params):
             # in-place is fine because we don't need grads on targets
             current.data *= polyak
             current.data += (1 - polyak) * new.data
+            assert current.grad is None
+            assert current.requires_grad is False
 
     def update_target(self):
-        self._do_target_update(self.target_q_networks.parameters(),
-                               self.q_networks.parameters())
-        self._do_target_update(self.target_policy.parameters(),
-                               self.policy.parameters())
+        if self._should_update_pol_and_target:
+            self._do_target_update(self.target_q_networks.parameters(),
+                                   self.q_networks.parameters())
+            self._do_target_update(self.target_policy.parameters(),
+                                   self.policy.parameters())
