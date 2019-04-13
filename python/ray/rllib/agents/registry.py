@@ -34,6 +34,11 @@ def _import_apex_ddpg():
     return ddpg.ApexDDPGTrainer
 
 
+def _import_td3():
+    from ray.rllib.agents import td3
+    return td3.TD3Trainer
+
+
 def _import_ppo():
     from ray.rllib.agents import ppo
     return ppo.PPOTrainer
@@ -86,6 +91,7 @@ def _import_marwil():
 
 ALGORITHMS = {
     "DDPG": _import_ddpg,
+    "TD3": _import_td3,
     "APEX_DDPG": _import_apex_ddpg,
     "PPO": _import_ppo,
     "ES": _import_es,

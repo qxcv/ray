@@ -34,6 +34,10 @@ class ConstantSchedule(object):
         return self._v
 
 
+def step_interpolation(l, r, alpha):
+    return l
+
+
 def linear_interpolation(l, r, alpha):
     return l + alpha * (r - l)
 
