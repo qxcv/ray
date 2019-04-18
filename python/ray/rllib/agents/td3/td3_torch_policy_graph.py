@@ -88,8 +88,9 @@ class TD3Loss(nn.Module):
     def forward(self, obs, act, rew, obs_next, dones):
         act_noise = torch.normal(torch.zeros_like(act), self.target_noise) \
             .clamp(-self.noise_clip, self.noise_clip)
-        target_acts = (self.target_policy(obs_next) + act_noise) \
-            .clamp(-self.max_action, self.max_action)
+        # TODO: before I was clamping target_acts to sit in valid range of
+        # [-1,1]; was that a bad idea?
+        target_acts = (self.target_policy(obs_next) + act_noise)
         min_q_next = torch.min(*self.target_q_networks(obs_next, target_acts))
         dones_f = dones.float()
         targets = rew + self.gamma * (1 - dones_f) * min_q_next
