@@ -3,9 +3,10 @@ from __future__ import division
 from __future__ import print_function
 
 import logging
+import time
 
-from ray.rllib.agents.trainer import with_common_config
-from ray.rllib.agents.dqn.dqn import DQNTrainer
+from ray.rllib import optimizers
+from ray.rllib.agents.trainer import Trainer, with_common_config
 from ray.rllib.agents.td3.td3_torch_policy_graph import TD3TorchPolicyGraph
 from ray.rllib.evaluation.metrics import collect_metrics
 from ray.rllib.utils.annotations import override
@@ -23,25 +24,18 @@ DEFAULT_CONFIG = with_common_config({
     # TD3 reference impl does not use any of the following things, but base DQN
     # trainer does
     "grad_norm_clipping": None,
-    "prioritized_replay": False,
-    "prioritized_replay_alpha": 0.6,
-    "prioritized_replay_beta": 0.4,
-    "prioritized_replay_eps": 1e-6,
-    "beta_annealing_fraction": 0.2,
-    "final_prioritized_replay_beta": 0.4,
-    "schedule_max_timesteps": 0,
     "compress_observations": True,
     "optimizer_class": "SyncReplayOptimizer",
+    "prioritized_replay": False,
     "min_iter_time_s": 1,
-    "per_worker_exploration": False,
-    # TO ADD: "num_workers": 0
+    "num_workers": 0,
 
     "evaluation_interval": 10,
-    "evaluation_num_episodes": 10,
+    "evaluation_num_episodes": 5,
 
     # "steps_per_epoch": 5000,  # FIXME what does this map to in rllib?
-    "sample_batch_size": 5,  # ??? is this the right way to implement steps_per_epoch?
-    "timesteps_per_iteration": 5000,  # ??? same here, I think this controls how many env steps we have to wait for before optimising, but I'm not certain
+    "sample_batch_size": 1,  # ??? is this the right way to implement steps_per_epoch?
+    "timesteps_per_iteration": 1000,  # ??? same here, I think this controls how many env steps we have to wait for before optimising, but I'm not certain
 
     "epochs": 100,  # FIXME too
 
@@ -83,25 +77,21 @@ DEFAULT_CONFIG = with_common_config({
 # __sphinx_doc_end__
 # yapf: enable
 
+OPTIMIZER_SHARED_CONFIGS = [
+    "buffer_size",
+    "sample_batch_size",
+    "train_batch_size",
+    "learning_starts",
+    "prioritized_replay",
+]
 
-# TODO: don't have this inherit from DQNTrainer, because I have no fucking idea
-# what DQNTrainer actually does. Instead, inherit from Trainer directly.
-class TD3Trainer(DQNTrainer):
+
+class TD3Trainer(Trainer):
     """TD3 implementation in PyTorch (maybe TF in future)."""
     _name = "TD3"
     _default_config = DEFAULT_CONFIG
     _policy_graph = TD3TorchPolicyGraph
-
-    @override(DQNTrainer)
-    def update_target_if_needed(self):
-        # XXX: this is really pointless; I should always be updating the policy
-        # no matter what, so there's no need to separate
-        # update_target_if_needed() out from _train().
-        def target_updater(p, _):
-            p.update_target()
-        self.local_evaluator.foreach_trainable_policy(target_updater)
-        self.last_target_update_ts = self.global_timestep
-        self.num_target_updates += 1
+    _optimizer_shared_configs = OPTIMIZER_SHARED_CONFIGS
 
     def _evaluate(self):
         logger.info("Evaluating current policy for {} episodes".format(
@@ -114,13 +104,118 @@ class TD3Trainer(DQNTrainer):
         self.evaluation_ev.foreach_policy(lambda p, _: p.set_test_mode(False))
         return {"evaluation": metrics}
 
-    @override(DQNTrainer)
-    def _make_exploration_schedule(self, worker_index):
+    # HACK HACK HACK copy-pasting DQNTrainer shit and removing the stuff I
+    # don't need
+
+    @override(Trainer)
+    def _init(self, config, env_creator):
+        self._validate_config(config)
+
+        # Update effective batch size to include n-step
+        adjusted_batch_size = max(config["sample_batch_size"],
+                                  config.get("n_step", 1))
+        config["sample_batch_size"] = adjusted_batch_size
+
         # Like Spinning Up, we do pure exploration for
         # self.config["start_steps"] but does no exploration at all thereafter.
         # TODO: make sure we don't update the policy in that time, either
-        return PiecewiseSchedule(endpoints=[
+        self.exploration0 = PiecewiseSchedule(endpoints=[
             (0, 1.0), (self.config["random_explore_steps"], 0.0)
         ],
-                                 interpolation=step_interpolation,
-                                 outside_value=0.0)
+                                              interpolation=step_interpolation,
+                                              outside_value=0.0)
+        self.explorations = [
+            self._make_exploration_schedule(i)
+            for i in range(config["num_workers"])
+        ]
+
+        for k in self._optimizer_shared_configs:
+            if k not in config["optimizer"]:
+                config["optimizer"][k] = config[k]
+
+        self.local_evaluator = self.make_local_evaluator(
+            env_creator, self._policy_graph)
+
+        if config["evaluation_interval"]:
+            self.evaluation_ev = self.make_local_evaluator(
+                env_creator,
+                self._policy_graph,
+                extra_config={
+                    "batch_mode": "complete_episodes",
+                    "batch_steps": 1,
+                })
+            self.evaluation_metrics = self._evaluate()
+
+        def create_remote_evaluators():
+            return self.make_remote_evaluators(env_creator, self._policy_graph,
+                                               config["num_workers"])
+
+        assert config["optimizer_class"] != "AsyncReplayOptimizer"
+        self.remote_evaluators = create_remote_evaluators()
+
+        self.optimizer = getattr(optimizers, config["optimizer_class"])(
+            self.local_evaluator, self.remote_evaluators, config["optimizer"])
+        # Create the remote evaluators *after* the replay actors
+        if self.remote_evaluators is None:
+            self.remote_evaluators = create_remote_evaluators()
+            self.optimizer._set_evaluators(self.remote_evaluators)
+
+        self.last_target_update_ts = 0
+        self.num_target_updates = 0
+
+    @override(Trainer)
+    def _train(self):
+        start_timestep = self.global_timestep
+
+        # Update worker explorations
+        exp_vals = [self.exploration0.value(self.global_timestep)]
+        self.local_evaluator.foreach_trainable_policy(lambda p, _: p.
+                                                      set_epsilon(exp_vals[0]))
+        for i, e in enumerate(self.remote_evaluators):
+            exp_val = self.explorations[i].value(self.global_timestep)
+            e.foreach_trainable_policy.remote(lambda p, _: p.set_epsilon(
+                exp_val))
+            exp_vals.append(exp_val)
+
+        # Do optimization steps
+        start = time.time()
+        while (self.global_timestep - start_timestep <
+               self.config["timesteps_per_iteration"]
+               ) or time.time() - start < self.config["min_iter_time_s"]:
+            # I believe this scatters weights to workers, pulls new experience
+            # from them, and updates weights
+            self.optimizer.step()
+
+            def target_updater(p, _):
+                p.update_target()
+
+            self.local_evaluator.foreach_trainable_policy(target_updater)
+            self.last_target_update_ts = self.global_timestep
+            self.num_target_updates += 1
+
+        result = self.collect_metrics()
+
+        result.update(timesteps_this_iter=self.global_timestep -
+                      start_timestep,
+                      info=dict(
+                          {
+                              "min_exploration": min(exp_vals),
+                              "max_exploration": max(exp_vals),
+                              "num_target_updates": self.num_target_updates,
+                          }, **self.optimizer.stats()))
+
+        if self.config["evaluation_interval"]:
+            if self.iteration % self.config["evaluation_interval"] == 0:
+                self.evaluation_metrics = self._evaluate()
+            result.update(self.evaluation_metrics)
+
+        return result
+
+    @property
+    def global_timestep(self):
+        return self.optimizer.num_steps_sampled
+
+    def __setstate__(self, state):
+        Trainer.__setstate__(self, state)
+        self.num_target_updates = state["num_target_updates"]
+        self.last_target_update_ts = state["last_target_update_ts"]

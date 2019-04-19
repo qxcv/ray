@@ -215,6 +215,12 @@ class TD3TorchPolicyGraph(TorchPolicyGraph):
                         **kwargs):
         with self.lock:
             with torch.no_grad():
+                # if not hasattr(self, 'pol_forwards'):
+                #     self.pol_forwards = 0
+                # self.pol_forwards += 1
+                # if self.pol_forwards % 1000 == 0:  # XXX
+                #     print('[ACTOR] running forward ({:,})'.format(
+                #         self.pol_forwards))
                 # print('[ROLLOUTS] computing some actions (eps=%.3g)' %
                 #       self.exploration_fraction)
                 if self.exploration_fraction > 1 - 1e-5 and not self.test_mode:
