@@ -47,6 +47,14 @@ class PolicyNetwork(nn.Module):
         pi_out = self.pi_unscaled.forward(state)
         # ensure action is in (-max_action, max_action)
         rescaled = pi_out.new_tensor(self.max_action) * torch.tanh(pi_out)
+        # if np.random.random() < 0.1:
+        #     print(
+        #         'Parameter vector 2-norm:',
+        #         ', '.join('%.4g' % torch.norm(p, 2)
+        #                   for p in self.parameters()))
+        #     print('[PolicyNetwork] forward pass:')
+        #     print('  pi_out =', pi_out)
+        #     print('  rescaled =', rescaled)
         return rescaled
 
 
@@ -86,25 +94,32 @@ class TD3Loss(nn.Module):
         self.max_action = max_action
 
     def forward(self, obs, act, rew, obs_next, dones):
-        act_noise = torch.normal(torch.zeros_like(act), self.target_noise) \
-            .clamp(-self.noise_clip, self.noise_clip)
-        # TODO: before I was clamping target_acts to sit in valid range of
-        # [-1,1]; was that a bad idea?
-        target_acts = self.target_policy(obs_next) + act_noise
-        target_next_q1, target_next_q2 = self.target_q_networks(
-            obs_next, target_acts)
-        min_q_next = torch.min(target_next_q1, target_next_q2)
-        assert target_next_q1.shape == target_next_q2.shape
-        assert min_q_next.shape == target_next_q2.shape
-        dones_f = dones.float()
-        targets = rew + self.gamma * (1 - dones_f) * min_q_next
-        targets = targets.detach()
+        with torch.no_grad():
+            act_noise = torch.normal(torch.zeros_like(act), self.target_noise)
+            act_noise = act_noise.clamp(-self.noise_clip, self.noise_clip)
+            target_acts = (self.target_policy(obs_next) + act_noise) \
+                .clamp(-self.max_action, self.max_action)
+            target_next_q1, target_next_q2 = self.target_q_networks(
+                obs_next, target_acts)
+            # if np.random.random() < 0.01:
+            #     print('[TD3Loss] target_next_q1[:10] =', target_next_q1[:10])
+            #     print('[TD3Loss] target_next_q2[:10] =', target_next_q2[:10])
+            min_q_next = torch.min(target_next_q1, target_next_q2)
+            assert target_next_q1.shape == target_next_q2.shape
+            assert min_q_next.shape == target_next_q2.shape
+            dones_f = dones.float()
+            targets = rew + self.gamma * (1 - dones_f) * min_q_next
+            targets = targets.detach()  # not really needed with no_grad()
         next_q1, next_q2 = self.q_networks(obs, act)
+        # if np.random.random() < 0.01:
+        #     print('[TD3Loss] Average q1 %.3g, average q2 %.3g' %
+        #           (next_q1.mean(), next_q2.mean()))
         q_loss = F.mse_loss(next_q1, targets) + F.mse_loss(next_q2, targets)
         # FIXME: is there some way to prevent policy_loss.backward() from
         # touching grads for parameters of self.q_networks?
-        policy_loss = -self.q_networks \
-            .forward_q_pi(obs, self.policy(obs)).mean()
+        on_policy_acts = self.policy(obs)
+        on_policy_q = self.q_networks.forward_q_pi(obs, on_policy_acts)
+        policy_loss = -on_policy_q.mean()
         return q_loss, policy_loss
 
 
@@ -202,14 +217,24 @@ class TD3TorchPolicyGraph(TorchPolicyGraph):
             with torch.no_grad():
                 # print('[ROLLOUTS] computing some actions (eps=%.3g)' %
                 #       self.exploration_fraction)
-                ob = torch.from_numpy(np.array(obs_batch)).float()
-                # normally we just compute noisy actions
-                actions = self.policy(ob).detach()
-                action_noise = self.config['act_noise'] * torch.normal(
-                    torch.zeros_like(actions), torch.ones_like(actions))
-                if self.test_mode:
-                    action_noise *= 0
-                actions = actions + action_noise
+                if self.exploration_fraction > 1 - 1e-5 and not self.test_mode:
+                    # if we're doing pure exploration, then we don't bother
+                    # with forward prop at all
+                    # TODO: unify this with actual forward prop code so that it
+                    # works better
+                    batch_size = len(obs_batch)
+                    act_dim, = self.action_space.shape
+                    actions = torch.zeros((batch_size, act_dim))
+                    self.exploration_fraction = 1
+                else:
+                    ob = torch.from_numpy(np.array(obs_batch)).float()
+                    # normally we just compute noisy actions
+                    actions = self.policy(ob).detach()
+                    action_noise = self.config['act_noise'] * torch.normal(
+                        torch.zeros_like(actions), torch.ones_like(actions))
+                    if self.test_mode:
+                        action_noise *= 0
+                    actions = actions + action_noise
                 # sometimes we also do exploration by re-sampling a subset of
                 # actions at uniform
                 if self.exploration_fraction > 0 and not self.test_mode:
@@ -224,6 +249,7 @@ class TD3TorchPolicyGraph(TorchPolicyGraph):
                             [self.action_space.sample() for i in to_randomise],
                             axis=0)
                         actions[to_randomise] = actions.new_tensor(random_acts)
+                actions = actions.clamp(-self.max_action, self.max_action)
                 # TODO: support recurrent policies (I think that's what the
                 # model output state thing is for; I've left it as empty list)
                 return (actions.numpy(), [], self.extra_action_out(actions))
@@ -262,7 +288,7 @@ class TD3TorchPolicyGraph(TorchPolicyGraph):
     @override(PolicyGraph)
     def apply_gradients(self, grad_dict):
         with self.lock:
-            # XXX remove this later
+            # XXX remove asserts later
             assert len(grad_dict['policy']) \
                 == len(list(self.policy.parameters()))
             for g, p in zip(grad_dict['policy'], self.policy.parameters()):
@@ -272,7 +298,12 @@ class TD3TorchPolicyGraph(TorchPolicyGraph):
             for g, p in zip(grad_dict['q_networks'],
                             self.q_networks.parameters()):
                 p.grad = torch.from_numpy(g)
-            # print('[CRITIC] updating')
+            # if not hasattr(self, 'crit_updates'):
+            #     self.crit_updates = 0
+            # self.crit_updates += 1
+            # if self.crit_updates % 100 == 0:  # XXX
+            #     print('[CRITIC] doing an update ({:,})'.format(
+            #         self.crit_updates))
             self.q_optimizer.step()
             self.num_q_updates += 1
 
