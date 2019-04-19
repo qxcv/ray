@@ -3,7 +3,6 @@ from __future__ import division
 from __future__ import print_function
 
 import collections
-import itertools as it
 
 from gym.spaces import Box
 import numpy as np
