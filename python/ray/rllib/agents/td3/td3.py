@@ -215,7 +215,15 @@ class TD3Trainer(Trainer):
     def global_timestep(self):
         return self.optimizer.num_steps_sampled
 
+    def __getstate__(self):
+        state = Trainer.__getstate__(self)
+        state.update({
+            "num_target_updates": self.num_target_updates,
+            "last_target_update_ts": self.last_target_update_ts,
+        })
+        return state
+
     def __setstate__(self, state):
         Trainer.__setstate__(self, state)
-        self.num_target_updates = state["num_target_updates"]
-        self.last_target_update_ts = state["last_target_update_ts"]
+        self.num_target_updates = state.get("num_target_updates", 0)
+        self.last_target_update_ts = state.get("last_target_update_ts", 0)

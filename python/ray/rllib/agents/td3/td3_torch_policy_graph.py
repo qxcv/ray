@@ -47,7 +47,7 @@ class PolicyNetwork(nn.Module):
         pi_out = self.pi_unscaled.forward(state)
         # ensure action is in (-max_action, max_action)
         rescaled = pi_out.new_tensor(self.max_action) * torch.tanh(pi_out)
-        # if np.random.random() < 0.1:
+        # if np.random.random() < 0.01:
         #     print(
         #         'Parameter vector 2-norm:',
         #         ', '.join('%.4g' % torch.norm(p, 2)
@@ -71,13 +71,13 @@ class TwinQNetwork(nn.Module):
     def forward(self, state, action):
         """Forward prop through both Q-networks, returning two Q-values."""
         state_action = torch.cat((state, action), -1)
-        return self.q1(state_action), self.q2(state_action)
+        return self.q1(state_action)[:, 0], self.q2(state_action)[:, 0]
 
     def forward_q_pi(self, state, action):
         """Forward prop through only the first Q network. This is useful when
         doing policy updates."""
         state_action = torch.cat((state, action), -1)
-        return self.q1(state_action)
+        return self.q1(state_action)[:, 0]
 
 
 class TD3Loss(nn.Module):
@@ -105,18 +105,19 @@ class TD3Loss(nn.Module):
             #     print('[TD3Loss] target_next_q1[:10] =', target_next_q1[:10])
             #     print('[TD3Loss] target_next_q2[:10] =', target_next_q2[:10])
             min_q_next = torch.min(target_next_q1, target_next_q2)
-            assert target_next_q1.shape == target_next_q2.shape
-            assert min_q_next.shape == target_next_q2.shape
             dones_f = dones.float()
+            assert min_q_next.shape == target_next_q1.shape
+            assert min_q_next.shape == target_next_q2.shape
+            assert min_q_next.shape == rew.shape
+            assert min_q_next.shape == dones_f.shape
             targets = rew + self.gamma * (1 - dones_f) * min_q_next
             targets = targets.detach()  # not really needed with no_grad()
+            assert targets.shape == dones_f.shape
         next_q1, next_q2 = self.q_networks(obs, act)
         # if np.random.random() < 0.01:
         #     print('[TD3Loss] Average q1 %.3g, average q2 %.3g' %
         #           (next_q1.mean(), next_q2.mean()))
         q_loss = F.mse_loss(next_q1, targets) + F.mse_loss(next_q2, targets)
-        # FIXME: is there some way to prevent policy_loss.backward() from
-        # touching grads for parameters of self.q_networks?
         on_policy_acts = self.policy(obs)
         on_policy_q = self.q_networks.forward_q_pi(obs, on_policy_acts)
         policy_loss = -on_policy_q.mean()
@@ -160,10 +161,6 @@ class TD3TorchPolicyGraph(TorchPolicyGraph):
                                            self.max_action)
         self._copy_weights(self.target_q_networks, self.q_networks)
         self._copy_weights(self.target_policy, self.policy)
-        for param in it.chain(self.target_q_networks.parameters(),
-                              self.target_policy.parameters()):
-            param.grad = None
-            param.requires_grad = False
 
         self.policy_optimizer = torch.optim.Adam(self.policy.parameters(),
                                                  lr=self.config["pi_lr"])
@@ -348,7 +345,6 @@ class TD3TorchPolicyGraph(TorchPolicyGraph):
             # in-place is fine because we don't need grads on targets
             current.data = polyak * current.data + (1 - polyak) * new.data
             assert current.grad is None
-            assert current.requires_grad is False
 
     def update_target(self):
         if self._should_update_pol_and_target:
