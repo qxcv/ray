@@ -97,8 +97,9 @@ class TD3Trainer(DQNTrainer):
         # XXX: this is really pointless; I should always be updating the policy
         # no matter what, so there's no need to separate
         # update_target_if_needed() out from _train().
-        self.local_evaluator.foreach_trainable_policy(lambda p, _: p.
-                                                      update_target())
+        def target_updater(p, _):
+            p.update_target()
+        self.local_evaluator.foreach_trainable_policy(target_updater)
         self.last_target_update_ts = self.global_timestep
         self.num_target_updates += 1
 

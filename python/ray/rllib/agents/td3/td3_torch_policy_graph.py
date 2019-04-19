@@ -90,8 +90,12 @@ class TD3Loss(nn.Module):
             .clamp(-self.noise_clip, self.noise_clip)
         # TODO: before I was clamping target_acts to sit in valid range of
         # [-1,1]; was that a bad idea?
-        target_acts = (self.target_policy(obs_next) + act_noise)
-        min_q_next = torch.min(*self.target_q_networks(obs_next, target_acts))
+        target_acts = self.target_policy(obs_next) + act_noise
+        target_next_q1, target_next_q2 = self.target_q_networks(
+            obs_next, target_acts)
+        min_q_next = torch.min(target_next_q1, target_next_q2)
+        assert target_next_q1.shape == target_next_q2.shape
+        assert min_q_next.shape == target_next_q2.shape
         dones_f = dones.float()
         targets = rew + self.gamma * (1 - dones_f) * min_q_next
         targets = targets.detach()
@@ -139,10 +143,8 @@ class TD3TorchPolicyGraph(TorchPolicyGraph):
         self.target_q_networks = TwinQNetwork(self.dim_state, self.dim_action)
         self.target_policy = PolicyNetwork(self.dim_state, self.dim_action,
                                            self.max_action)
-        self._copy_weights(self.target_q_networks.parameters(),
-                           self.q_networks.parameters())
-        self._copy_weights(self.target_policy.parameters(),
-                           self.policy.parameters())
+        self._copy_weights(self.target_q_networks, self.q_networks)
+        self._copy_weights(self.target_policy, self.policy)
         for param in it.chain(self.target_q_networks.parameters(),
                               self.target_policy.parameters()):
             param.grad = None
@@ -198,6 +200,8 @@ class TD3TorchPolicyGraph(TorchPolicyGraph):
                         **kwargs):
         with self.lock:
             with torch.no_grad():
+                # print('[ROLLOUTS] computing some actions (eps=%.3g)' %
+                #       self.exploration_fraction)
                 ob = torch.from_numpy(np.array(obs_batch)).float()
                 # normally we just compute noisy actions
                 actions = self.policy(ob).detach()
@@ -205,8 +209,7 @@ class TD3TorchPolicyGraph(TorchPolicyGraph):
                     torch.zeros_like(actions), torch.ones_like(actions))
                 if self.test_mode:
                     action_noise *= 0
-                actions = (actions + action_noise) \
-                    .clamp(-self.max_action, self.max_action)
+                actions = actions + action_noise
                 # sometimes we also do exploration by re-sampling a subset of
                 # actions at uniform
                 if self.exploration_fraction > 0 and not self.test_mode:
@@ -238,38 +241,45 @@ class TD3TorchPolicyGraph(TorchPolicyGraph):
                     value = value.astype('uint8')
                 loss_in.append(torch.from_numpy(value))
             q_loss, policy_loss = self._loss(*loss_in)
-            # Computing policy loss grads will actually change the grads for
-            # the q nets (because policy loss passes policy outputs *through*
-            # q1). Hence, we do policy loss first and then zero the grads for q
-            # network before computing q loss for real (which will not change
-            # policy loss).
+            grad_dict = {'policy': [], 'q_networks': []}
+            # DANGER: return values are just references; calling zero_grad
+            # later will modify the values.
+            # Also, be careful with policy objective: it backprops though Q
+            # network, so policy_loss.backward() will also change Q-network
+            # gradients (unfortunately).
             self.policy_optimizer.zero_grad()
             self.q_optimizer.zero_grad()
             policy_loss.backward()
+            for p in self.policy.parameters():
+                grad_dict['policy'].append(p.grad.data.numpy())
+            # now Q grad
             self.q_optimizer.zero_grad()
             q_loss.backward()
-            # Note that return values are just references;
-            # calling zero_grad will modify the values
-            grads = []
-            for p in self._model.parameters():
-                if p.grad is not None:
-                    grads.append(p.grad.data.numpy())
-                else:
-                    grads.append(None)
-            return grads, {}
+            for p in self.q_networks.parameters():
+                grad_dict['q_networks'].append(p.grad.data.numpy())
+            return grad_dict, {}
 
     @override(PolicyGraph)
-    def apply_gradients(self, gradients):
+    def apply_gradients(self, grad_dict):
         with self.lock:
-            for g, p in zip(gradients, self._model.parameters()):
-                if g is not None:
-                    p.grad = torch.from_numpy(g)
+            # XXX remove this later
+            assert len(grad_dict['policy']) \
+                == len(list(self.policy.parameters()))
+            for g, p in zip(grad_dict['policy'], self.policy.parameters()):
+                p.grad = torch.from_numpy(g)
+            assert len(grad_dict['q_networks']) \
+                == len(list(self.q_networks.parameters()))
+            for g, p in zip(grad_dict['q_networks'],
+                            self.q_networks.parameters()):
+                p.grad = torch.from_numpy(g)
+            # print('[CRITIC] updating')
             self.q_optimizer.step()
             self.num_q_updates += 1
 
             # policy update delay (the zero_grad() calls in compute_gradients()
             # should ensure that we don't accumulate gradients accidentally)
             if self._should_update_pol_and_target:
+                # print('[POLICY] updating')
                 self.policy_optimizer.step()
 
             return {}
@@ -290,21 +300,22 @@ class TD3TorchPolicyGraph(TorchPolicyGraph):
     def set_test_mode(self, value):
         self.test_mode = value
 
-    def _copy_weights(self, current_params, new_params):
-        for current, new in zip(current_params, new_params):
-            current.data[:] = new.data[:]
+    def _copy_weights(self, model_to_update, model_to_update_towards):
+        # copy weights from one module (second argument) to another (first
+        # argument)
+        model_to_update.load_state_dict(model_to_update_towards.state_dict())
 
     def _do_target_update(self, current_target_params, new_params):
         polyak = self.config['polyak']
         for current, new in zip(current_target_params, new_params):
             # in-place is fine because we don't need grads on targets
-            current.data *= polyak
-            current.data += (1 - polyak) * new.data
+            current.data = polyak * current.data + (1 - polyak) * new.data
             assert current.grad is None
             assert current.requires_grad is False
 
     def update_target(self):
         if self._should_update_pol_and_target:
+            # print('[TARGET] updating')
             self._do_target_update(self.target_q_networks.parameters(),
                                    self.q_networks.parameters())
             self._do_target_update(self.target_policy.parameters(),
