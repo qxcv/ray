@@ -1,0 +1,16 @@
+data_dir: data
+discrim_config:
+  batch_size: 128
+  lr: 0.001
+  model:
+    fcnet_activation: relu
+    fcnet_hiddens:
+    - 64
+    - 64
+  updates_per_epoch: 20
+env_name: InvertedPendulum-v2
+expert_config:
+  expert_subdir: demos
+  output_timesteps: 10000
+  train_timesteps: 50000
+seed: 122900136

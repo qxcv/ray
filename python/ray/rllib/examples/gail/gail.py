@@ -2,7 +2,9 @@
 
 import os
 
-os.environ["MKL_NUM_THREADS"] = str(1)
+# TODO: only set these during benchmarking
+# os.environ["MKL_NUM_THREADS"] = str(1)
+# os.environ["OMP_NUM_THREADS"] = str(1)
 
 import gym  # noqa: E402
 
@@ -16,10 +18,11 @@ from ray.rllib.evaluation.sample_batch import SampleBatch  # noqa: E402
 from ray.rllib.offline.json_writer import JsonWriter  # noqa: E402
 from ray.rllib.offline.json_reader import JsonReader  # noqa: E402
 from ray.rllib.models import ModelCatalog  # noqa: E402
-from ray.tune.logger import pretty_print  # noqa: E402
+from ray.tune.logger import CSVLogger, pretty_print  # noqa: E402
 from ray.tune.util import merge_dicts  # noqa: E402
 
 from sacred import Experiment  # noqa: E402
+from sacred.observers import FileStorageObserver  # noqa: E402
 
 import tensorflow as tf  # noqa: E402
 
@@ -43,9 +46,8 @@ class Discriminator(object):
         # 1 = real, 0 = fake
         self.is_real_t = tf.placeholder(tf.float32, (None, ), 'is_real_t')
         self.is_training = tf.placeholder(tf.bool, (), 'is_training')
-        # TODO: add mixup regulariser & see if it lets us do re-opt :D
-        # TODO: also make sure we get the right scope so that we can use
-        # TFVariables
+        # TODO: make sure we get the right scope so that we can use TFVariables
+        # between policy & discriminator
         with tf.variable_scope('default_policy/reward_net') as scope:
             self.logits = self._make_discrim_logits(self.obs_t, self.act_t)
             discrim_train_vars = tf.get_collection(
@@ -103,13 +105,15 @@ def cfg():
             "fcnet_activation": "relu"
         }
     }
-    # TODO: figure out how to put a unique expt ID in here
+    # TODO: figure out how to put a unique expt ID in here (maybe Sacred can
+    # help?)
     data_dir = 'data'  # noqa: F841
     expert_config = {  # noqa: F841
         "train_timesteps": 50000,
         "expert_subdir": 'demos',
         "output_timesteps": 10000,
     }
+    # TODO: decide what to do with this...
     td3_conf = {}
     tf_par_conf = {  # noqa: F841
         "inter_par_threads": 1,
@@ -122,7 +126,7 @@ def fix_cfg_relpaths(config, command_name, logger):
     full_data_dir = os.path.join(os.getcwd(), config["data_dir"],
                                  config["env_name"])
     return {
-        "data_dir": full_data_dir,
+        "full_data_dir": full_data_dir,
         "expert_config": {
             "expert_dir": os.path.join(
                 full_data_dir, config["expert_config"]["expert_subdir"])
@@ -130,7 +134,8 @@ def fix_cfg_relpaths(config, command_name, logger):
     }
 
 
-def load_latest_demos(demo_dir):
+@ex.capture
+def load_latest_demos(demo_dir, _run):
     demo_paths = []
     for file_name in os.listdir(demo_dir):
         if os.path.splitext(file_name)[-1].lower() == '.json':
@@ -141,14 +146,19 @@ def load_latest_demos(demo_dir):
     # now read samples back out
     # this api is so fucked
     demo_reader = JsonReader(demo_path)
+    _run.add_resource(demo_path)
     demos = SampleBatch.concat_samples(list(demo_reader))
     return demos
 
 
 @ex.main
-def main(env_name, discrim_config, expert_config, tf_par_conf, td3_conf):
+def main(env_name, discrim_config, expert_config, full_data_dir, tf_par_conf,
+         td3_conf, _config, _run):
     """Run GAIL on a given environment. Assumes that you've already used
     train_expert to collect expert demos for the environment."""
+    out_dir = os.path.join(full_data_dir, "gail_run_%s" % _run._id)
+    os.makedirs(out_dir, exist_ok=True)
+    stat_logger = CSVLogger(config=_config, logdir=out_dir)
     env = gym.make(env_name)
     discriminator = Discriminator(discrim_config, env.observation_space,
                                   env.action_space)
@@ -159,9 +169,9 @@ def main(env_name, discrim_config, expert_config, tf_par_conf, td3_conf):
         "intra_op_parallelism_threads": tf_par_conf["intra_par_threads"]
     }
     td3_base_conf = {
-            "reward_model": discrim_config["model"],
-            "tf_session_args": tf_par_args,
-            "local_evaluator_tf_session_args": tf_par_args,
+        "reward_model": discrim_config["model"],
+        "tf_session_args": tf_par_args,
+        "local_evaluator_tf_session_args": tf_par_args,
     }
     td3_conf = merge_dicts(td3_base_conf, td3_conf)
     trainer = TD3Trainer(env=env_name, config=td3_conf)
@@ -178,6 +188,7 @@ def main(env_name, discrim_config, expert_config, tf_par_conf, td3_conf):
         sess.run(tf.global_variables_initializer())
         reward_vars = ray.experimental.tf_utils.TensorFlowVariables(
             discriminator.reward, sess)
+        discrim_updates = 0
         itr = 0
         while True:
             # update trainer's reward weights
@@ -203,7 +214,8 @@ def main(env_name, discrim_config, expert_config, tf_par_conf, td3_conf):
                     [fake_act_batch, real_act_ds[real_batch_inds]], axis=0)
 
                 # update the discriminator
-                _, discim_loss, discrim_acc = sess.run(
+                discrim_updates += len(label_batch)
+                _, discrim_loss, discrim_acc = sess.run(
                     [
                         discriminator.update_op, discriminator.loss,
                         discriminator.accuracy
@@ -218,13 +230,22 @@ def main(env_name, discrim_config, expert_config, tf_par_conf, td3_conf):
             # end of epoch, print stats
             print('Epoch %d:\n\t[discrim] Loss %.4g, accuracy %.4g\n\t'
                   '[actor] Mean episode reward %.4g' %
-                  (itr, discim_loss, discrim_acc,
+                  (itr, discrim_loss, discrim_acc,
                    step_result['episode_reward_mean']))
+            full_result = merge_dicts(step_result, {
+                "discrim_loss": discrim_loss,
+                "discrim_acc": discrim_acc,
+                "discrim_updates": discrim_updates,
+            })
+            del full_result["config"]
+            stat_logger.on_result(full_result)
+            # TODO: do this less often b/c each call has O(T) cost
+            _run.add_artifact(stat_logger._file.name)
             itr += 1
 
 
 @ex.command
-def train_expert(env_name, expert_config):
+def train_expert(env_name, expert_config, _run, _config):
     """Train a policy using the true reward function for the given
     environment."""
     expert_dir = expert_config["expert_dir"]
@@ -267,5 +288,12 @@ def train_expert(env_name, expert_config):
     print("  {}".format(pretty_print(metrics).replace("\n", "\n  ")))
 
 
-if __name__ == '__main__':
+def _init():
+    # TODO get the FSObserver output path from config
+    observer = FileStorageObserver.create("data/sacred-runs/")
+    ex.observers.append(observer)
     ex.run_commandline()
+
+
+if __name__ == '__main__':
+    _init()
