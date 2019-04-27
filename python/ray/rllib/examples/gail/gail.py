@@ -2,23 +2,26 @@
 
 import os
 
-import gym
+os.environ["MKL_NUM_THREADS"] = str(1)
 
-import numpy as np
+import gym  # noqa: E402
 
-import ray
-from ray import tune
-from ray.rllib.agents.ddpg import TD3Trainer
-from ray.rllib.evaluation.metrics import collect_metrics
-from ray.rllib.evaluation.sample_batch import SampleBatch
-from ray.rllib.offline.json_writer import JsonWriter
-from ray.rllib.offline.json_reader import JsonReader
-from ray.rllib.models import ModelCatalog
-from ray.tune.logger import pretty_print
+import numpy as np  # noqa: E402
 
-from sacred import Experiment
+import ray  # noqa: E402
+from ray import tune  # noqa: E402
+from ray.rllib.agents.ddpg import TD3Trainer  # noqa: E402
+from ray.rllib.evaluation.metrics import collect_metrics  # noqa: E402
+from ray.rllib.evaluation.sample_batch import SampleBatch  # noqa: E402
+from ray.rllib.offline.json_writer import JsonWriter  # noqa: E402
+from ray.rllib.offline.json_reader import JsonReader  # noqa: E402
+from ray.rllib.models import ModelCatalog  # noqa: E402
+from ray.tune.logger import pretty_print  # noqa: E402
+from ray.tune.util import merge_dicts  # noqa: E402
 
-import tensorflow as tf
+from sacred import Experiment  # noqa: E402
+
+import tensorflow as tf  # noqa: E402
 
 ex = Experiment('gail')
 
@@ -96,16 +99,34 @@ def cfg():
         "batch_size": 128,
         "updates_per_epoch": 50,
         "model": {
-            "fcnet_hiddens": [256, 128],
+            "fcnet_hiddens": [128, 128],
             "fcnet_activation": "relu"
         }
     }
     # TODO: figure out how to put a unique expt ID in here
-    data_dir = os.path.join(os.getcwd(), 'data', env_name)
+    data_dir = 'data'  # noqa: F841
     expert_config = {  # noqa: F841
-        "train_timesteps": 50000,  # XXX 50000,
-        "expert_dir": os.path.join(data_dir, 'demos'),
+        "train_timesteps": 50000,
+        "expert_subdir": 'demos',
         "output_timesteps": 10000,
+    }
+    td3_conf = {}
+    tf_par_conf = {  # noqa: F841
+        "inter_par_threads": 1,
+        "intra_par_threads": 1,
+    }
+
+
+@ex.config_hook
+def fix_cfg_relpaths(config, command_name, logger):
+    full_data_dir = os.path.join(os.getcwd(), config["data_dir"],
+                                 config["env_name"])
+    return {
+        "data_dir": full_data_dir,
+        "expert_config": {
+            "expert_dir": os.path.join(
+                full_data_dir, config["expert_config"]["expert_subdir"])
+        }
     }
 
 
@@ -125,15 +146,25 @@ def load_latest_demos(demo_dir):
 
 
 @ex.main
-def main(env_name, discrim_config, expert_config):
+def main(env_name, discrim_config, expert_config, tf_par_conf, td3_conf):
+    """Run GAIL on a given environment. Assumes that you've already used
+    train_expert to collect expert demos for the environment."""
     env = gym.make(env_name)
     discriminator = Discriminator(discrim_config, env.observation_space,
                                   env.action_space)
     ray.init()
-    td3_config = {
-        "reward_model": discrim_config["model"]
+    # algo config dict
+    tf_par_args = {
+        "inter_op_parallelism_threads": tf_par_conf["inter_par_threads"],
+        "intra_op_parallelism_threads": tf_par_conf["intra_par_threads"]
     }
-    trainer = TD3Trainer(env=env_name, config=td3_config)
+    td3_base_conf = {
+            "reward_model": discrim_config["model"],
+            "tf_session_args": tf_par_args,
+            "local_evaluator_tf_session_args": tf_par_args,
+    }
+    td3_conf = merge_dicts(td3_base_conf, td3_conf)
+    trainer = TD3Trainer(env=env_name, config=td3_conf)
     replay = trainer.optimizer.replay_buffers['default_policy']
     # stupid fake shit dataset to feed discriminator
     half_batch_size = max(1, discrim_config["batch_size"] // 2)
@@ -142,7 +173,8 @@ def main(env_name, discrim_config, expert_config):
     demos = load_latest_demos(expert_config["expert_dir"])
     real_obs_ds = demos['obs']
     real_act_ds = demos['actions']
-    with tf.Session() as sess:
+    sess_conf = tf.ConfigProto(**tf_par_args)
+    with tf.Session(config=sess_conf) as sess:
         sess.run(tf.global_variables_initializer())
         reward_vars = ray.experimental.tf_utils.TensorFlowVariables(
             discriminator.reward, sess)
@@ -161,8 +193,8 @@ def main(env_name, discrim_config, expert_config):
                 # it with some real data
                 fake_obs_batch, fake_act_batch, _, _, _ \
                     = replay.sample(half_batch_size)
-                real_batch_inds = np.random.choice(
-                    ds_range, size=(half_batch_size, ))
+                real_batch_inds = np.random.choice(ds_range,
+                                                   size=(half_batch_size, ))
                 label_batch = np.zeros((2 * half_batch_size, ))
                 label_batch[half_batch_size:] = 1.0
                 obs_batch = np.concatenate(
@@ -193,6 +225,8 @@ def main(env_name, discrim_config, expert_config):
 
 @ex.command
 def train_expert(env_name, expert_config):
+    """Train a policy using the true reward function for the given
+    environment."""
     expert_dir = expert_config["expert_dir"]
     ray.init()
     os.makedirs(expert_dir, exist_ok=True)
