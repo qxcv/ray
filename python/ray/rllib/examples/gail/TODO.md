@@ -15,3 +15,10 @@ Things left to implement:
 - Move to distributed SGD for the TD3 updates.
 - Benchmark all methods with increasing levels of parallelism. Create some plots
   that I can put in slides.
+
+
+Handy notes:
+
+- I can use TimerStat() to record how long things take. A lot of RLLib is
+  already instrumented like that; see `async_replay_optimizer.py` for an
+  example.

@@ -12,7 +12,7 @@ import numpy as np  # noqa: E402
 
 import ray  # noqa: E402
 from ray import tune  # noqa: E402
-from ray.rllib.agents.ddpg import TD3Trainer  # noqa: E402
+from ray.rllib.agents.ddpg import ApexTD3Trainer, TD3Trainer  # noqa: E402
 from ray.rllib.evaluation.metrics import collect_metrics  # noqa: E402
 from ray.rllib.evaluation.sample_batch import SampleBatch  # noqa: E402
 from ray.rllib.offline.json_writer import JsonWriter  # noqa: E402
@@ -172,9 +172,12 @@ def main(env_name, discrim_config, expert_config, full_data_dir, tf_par_conf,
         "reward_model": discrim_config["model"],
         "tf_session_args": tf_par_args,
         "local_evaluator_tf_session_args": tf_par_args,
+        "num_gpus": 0,
+        "num_workers": 1,
     }
     td3_conf = merge_dicts(td3_base_conf, td3_conf)
-    trainer = TD3Trainer(env=env_name, config=td3_conf)
+    # trainer = TD3Trainer(env=env_name, config=td3_conf)
+    trainer = ApexTD3Trainer(env=env_name, config=td3_conf)
     replay = trainer.optimizer.replay_buffers['default_policy']
     # stupid fake shit dataset to feed discriminator
     half_batch_size = max(1, discrim_config["batch_size"] // 2)

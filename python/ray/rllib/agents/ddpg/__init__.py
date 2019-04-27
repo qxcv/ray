@@ -3,6 +3,7 @@ from __future__ import division
 from __future__ import print_function
 
 from ray.rllib.agents.ddpg.apex import ApexDDPGTrainer
+from ray.rllib.agents.ddpg.apex_td3 import ApexTD3Trainer
 from ray.rllib.agents.ddpg.ddpg import DDPGTrainer, DEFAULT_CONFIG
 from ray.rllib.agents.ddpg.td3 import TD3Trainer
 from ray.rllib.utils import renamed_class
@@ -13,5 +14,5 @@ TD3Agent = renamed_class(TD3Trainer)
 
 __all__ = [
     "DDPGAgent", "ApexDDPGAgent", "TD3Agent", "DDPGTrainer", "ApexDDPGTrainer",
-    "TD3Trainer", "DEFAULT_CONFIG"
+    "TD3Trainer", "ApexTD3Trainer", "DEFAULT_CONFIG"
 ]
