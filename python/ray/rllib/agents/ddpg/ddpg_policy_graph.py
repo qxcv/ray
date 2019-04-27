@@ -28,6 +28,7 @@ Q_SCOPE = "q_func"
 Q_TARGET_SCOPE = "target_q_func"
 TWIN_Q_SCOPE = "twin_q_func"
 TWIN_Q_TARGET_SCOPE = "twin_target_q_func"
+REWARD_NETWORK_SCOPE = "reward_net"
 
 # Importance sampling weights for prioritized replay
 PRIO_WEIGHTS = "weights"
@@ -140,6 +141,12 @@ class DDPGPolicyGraph(DDPGPostprocessing, TFPolicyGraph):
         self.importance_weights = tf.placeholder(tf.float32, [None],
                                                  name="weight")
 
+        # reward network evaluation (optional)
+        if self.config["reward_model"]:
+            rew = self._build_reward_network(observation_space, action_space)
+        else:
+            rew = self.rew_t
+
         # policy network evaluation
         with tf.variable_scope(POLICY_SCOPE, reuse=True) as scope:
             prev_update_ops = set(tf.get_collection(tf.GraphKeys.UPDATE_OPS))
@@ -214,12 +221,12 @@ class DDPGPolicyGraph(DDPGPostprocessing, TFPolicyGraph):
         if self.config["twin_q"]:
             self.critic_loss, self.actor_loss, self.td_error \
                 = self._build_actor_critic_loss(
-                    q_t, q_tp1, q_t_det_policy, twin_q_t=twin_q_t,
+                    rew, q_t, q_tp1, q_t_det_policy, twin_q_t=twin_q_t,
                     twin_q_tp1=twin_q_tp1)
         else:
             self.critic_loss, self.actor_loss, self.td_error \
                 = self._build_actor_critic_loss(
-                    q_t, q_tp1, q_t_det_policy)
+                    rew, q_t, q_tp1, q_t_det_policy)
 
         if config["l2_reg"] is not None:
             for var in self.policy_vars:
@@ -296,9 +303,14 @@ class DDPGPolicyGraph(DDPGPostprocessing, TFPolicyGraph):
         self.sess.run(tf.global_variables_initializer())
 
         # Note that this encompasses both the policy and Q-value networks and
-        # their corresponding target networks
+        # their corresponding target networks; also includes reward net vars
+        # when applicable
         self.variables = ray.experimental.tf_utils.TensorFlowVariables(
-            tf.group(q_t_det_policy, q_tp1), self.sess)
+            tf.group(q_t_det_policy, q_tp1, rew), self.sess)
+
+        if self.config["reward_model"]:
+            self.reward_variables \
+                = ray.experimental.tf_utils.TensorFlowVariables(rew, self.sess)
 
         # Hard initial update
         self.update_target(tau=1.0)
@@ -458,6 +470,23 @@ class DDPGPolicyGraph(DDPGPostprocessing, TFPolicyGraph):
 
         return actions, model
 
+    def _build_reward_network(self, observation_space, action_space):
+        # FIXME: this should be de-duplicated with GAIL
+        rew_inputs = tf.concat([self.obs_t, self.act_t], axis=1)
+        with tf.variable_scope(REWARD_NETWORK_SCOPE) as scope:
+            rew_model = ModelCatalog.get_model(
+                {
+                    "obs": rew_inputs,
+                    "is_training": self._get_is_training_placeholder()
+                },
+                obs_space=observation_space,
+                action_space=action_space, num_outputs=1,
+                options=self.config["reward_model"])
+        rew_logits = tf.squeeze(rew_model.outputs, axis=1)
+        # give agent reward of -log(1-sigmoid(logits))=softplus(logits)
+        rew_synth = tf.nn.softplus(rew_logits)
+        return rew_synth
+
     def _build_exploration_noise(self, deterministic_actions,
                                  should_be_stochastic, noise_scale,
                                  enable_pure_exploration, action_space):
@@ -520,6 +549,7 @@ class DDPGPolicyGraph(DDPGPostprocessing, TFPolicyGraph):
         return actions
 
     def _build_actor_critic_loss(self,
+                                 rew,
                                  q_t,
                                  q_tp1,
                                  q_t_det_policy,
@@ -540,7 +570,7 @@ class DDPGPolicyGraph(DDPGPostprocessing, TFPolicyGraph):
         q_tp1_best_masked = (1.0 - self.done_mask) * q_tp1_best
 
         # compute RHS of bellman equation
-        q_t_selected_target = tf.stop_gradient(self.rew_t + gamma**n_step *
+        q_t_selected_target = tf.stop_gradient(rew + gamma**n_step *
                                                q_tp1_best_masked)
 
         # compute the error (potentially clipped)
@@ -627,6 +657,10 @@ class DDPGPolicyGraph(DDPGPostprocessing, TFPolicyGraph):
         tau = tau or self.tau_value
         return self.sess.run(self.update_target_expr,
                              feed_dict={self.tau: tau})
+
+    def set_reward_weights(self, new_weights):
+        # TODO: consider doing a moving average update or some shit
+        self.reward_variables.set_weights(new_weights)
 
     def set_epsilon(self, epsilon):
         # set_epsilon is called by optimizer to anneal exploration as

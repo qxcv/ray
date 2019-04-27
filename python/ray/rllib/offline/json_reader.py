@@ -40,6 +40,9 @@ class JsonReader(InputReader):
                 "/tmp/**/*.json", or a list of single file paths or URIs, e.g.,
                 ["s3://bucket/file.json", "s3://bucket/file2.json"].
             ioctx (IOContext): current IO context object.
+            repeat (bool): if true, will keep re-reading data cyclically
+                forever. Otherwise, StopIteration() will be raised on next()
+                as soon as each piece of data has been read once.
         """
 
         self.ioctx = ioctx or IOContext()
@@ -126,8 +129,7 @@ class JsonReader(InputReader):
                 self.files))
         return line
 
-    def _next_file(self):
-        path = random.choice(self.files)
+    def _open_file(self, path):
         if urlparse(path).scheme:
             if smart_open is None:
                 raise ValueError(
@@ -136,6 +138,20 @@ class JsonReader(InputReader):
             return smart_open(path, "r")
         else:
             return open(path, "r")
+
+    def _next_file(self):
+        path = random.choice(self.files)
+        return self._open_file(path)
+
+    def __iter__(self):
+        # iterates over all batches of data in order that batches appear
+        for data_path in self.files:
+            with self._open_file(data_path) as cur_file:
+                for line in cur_file:
+                    line = line.strip()
+                    batch = self._try_parse(line)
+                    if batch:
+                        yield self._postprocess_if_needed(batch)
 
 
 def _from_json(batch):
