@@ -2,6 +2,7 @@
 
 import collections
 import os
+import time
 
 # TODO: only set these during benchmarking
 # os.environ["MKL_NUM_THREADS"] = str(1)
@@ -32,6 +33,111 @@ from sacred.observers import FileStorageObserver  # noqa: E402
 import tensorflow as tf  # noqa: E402
 
 ex = Experiment('gail')
+
+
+@ray.remote(num_cpus=1)
+class DiscriminatorActor(object):
+    def __init__(self, env_name, disc_config, expert_config, td3_conf,
+                 tf_par_args, replay_actors):
+        env = gym.make(env_name)
+        self.discriminator = Discriminator(disc_config,
+                                           env.observation_space,
+                                           env.action_space)
+        del env
+        self.disc_updates = 0
+        self.disc_samples_seen = 0
+        self.min_iter_time_s = td3_conf["min_iter_time_s"]
+        self.min_iter_steps = disc_config["updates_per_epoch"]
+
+        self.half_batch_size = max(1, disc_config["batch_size"] // 2)
+        dataset_size = self.half_batch_size
+        demos = load_latest_demos(expert_config["expert_dir"])
+        self.ds_range = np.arange(dataset_size)
+        self.real_obs_ds = demos['obs']
+        self.real_act_ds = demos['actions']
+
+        sess_conf = tf.ConfigProto(**tf_par_args)
+        self.sess = tf.Session(config=sess_conf)
+        self.sess.run(tf.global_variables_initializer())
+        self.reward_vars = ray.experimental.tf_utils.TensorFlowVariables(
+            self.discriminator.reward, self.sess)
+
+        self.replay_sampler = LocalReplaySampler(
+            replay_actors,
+            # use 1/2 of real batch size b/c when training discrim we mix with
+            # and other 1/2 expert samples
+            batch_size=self.half_batch_size)
+
+    def train_epoch(self):
+        """Train for at least num_steps or until min_time has elapsed,
+        whichever happens last."""
+        disc_loss = disc_acc = 0.0
+        steps = 0
+        start_time = time.time()
+        min_steps = self.min_iter_steps
+        min_time = self.min_iter_time_s
+        while steps < min_steps or time.time() - start_time < min_time:
+            disc_loss, disc_acc = self._train_step()
+            steps += 1
+        return {
+            "disc_loss": disc_loss,
+            "disc_acc": disc_acc,
+            "disc_updates": self.disc_updates,
+            "disc_samples_seen": self.disc_samples_seen,
+        }
+
+    def get_reward_weights(self):
+        return self.reward_vars.get_weights()
+
+    def _train_step(self):
+        ma_batch = self.replay_sampler.get_batch()
+        if not ma_batch.policy_batches:
+            # sometimes this happens at the beginning of training b/c
+            # there are not enough samples in the replay buffer
+            return 0.0, 0.0
+        fake_batch = ma_batch.policy_batches["default_policy"]
+        fake_obs_batch = fake_batch['obs']
+        fake_act_batch = fake_batch['actions']
+        real_batch_inds = np.random.choice(self.ds_range,
+                                           size=(self.half_batch_size, ))
+        label_batch = np.zeros((2 * self.half_batch_size, ))
+        label_batch[self.half_batch_size:] = 1.0
+        obs_batch = np.concatenate(
+            [fake_obs_batch, self.real_obs_ds[real_batch_inds]], axis=0)
+        act_batch = np.concatenate(
+            [fake_act_batch, self.real_act_ds[real_batch_inds]], axis=0)
+
+        # update the discriminator
+        self.disc_updates += 1
+        self.disc_samples_seen += len(label_batch)
+        _, disc_loss, disc_acc = self.sess.run(
+            [
+                self.discriminator.update_op, self.discriminator.loss,
+                self.discriminator.accuracy
+            ],
+            feed_dict={
+                self.discriminator.obs_t: obs_batch,
+                self.discriminator.act_t: act_batch,
+                self.discriminator.is_real_t: label_batch,
+                self.discriminator.is_training: True,
+            })
+        return disc_loss, disc_acc
+
+
+@ray.remote(num_cpus=1)
+class TrainerActor(object):
+    def __init__(self, env_name, td3_conf):
+        self.trainer = ApexTD3Trainer(env=env_name, config=td3_conf)
+
+    def get_replay_actors(self):
+        return self.trainer.optimizer.replay_actors
+
+    def train_epoch(self):
+        return self.trainer.train()
+
+    def update_reward_weights(self, new_weights):
+        self.trainer.local_evaluator.foreach_trainable_policy(
+            lambda p, _: p.set_reward_weights(new_weights))
 
 
 class LocalReplaySampler(object):
@@ -169,7 +275,10 @@ def cfg():
         "expert_subdir": 'demos',
         "output_timesteps": 10000,
     }
-    td3_conf = {}  # noqa: F841
+    td3_conf = {  # noqa: F841
+        "evaluation_interval": 5,
+        "evaluation_num_episodes": 5,
+    }
     tf_par_conf = {  # noqa: F841
         "inter_par_threads": 1,
         "intra_par_threads": 1,
@@ -189,8 +298,7 @@ def fix_cfg_relpaths(config, command_name, logger):
     }
 
 
-@ex.capture
-def load_latest_demos(demo_dir, _run):
+def load_latest_demos(demo_dir):
     demo_paths = []
     for file_name in os.listdir(demo_dir):
         if os.path.splitext(file_name)[-1].lower() == '.json':
@@ -201,7 +309,6 @@ def load_latest_demos(demo_dir, _run):
     # now read samples back out
     # this api is so fucked
     demo_reader = JsonReader(demo_path)
-    _run.add_resource(demo_path)
     demos = SampleBatch.concat_samples(list(demo_reader))
     return demos
 
@@ -214,9 +321,6 @@ def main(env_name, discrim_config, expert_config, full_data_dir, tf_par_conf,
     out_dir = os.path.join(full_data_dir, "gail_run_%s" % _run._id)
     os.makedirs(out_dir, exist_ok=True)
     stat_logger = CSVLogger(config=_config, logdir=out_dir)
-    env = gym.make(env_name)
-    discriminator = Discriminator(discrim_config, env.observation_space,
-                                  env.action_space)
     ray.init()
     # algo config dict
     tf_par_args = {
@@ -231,94 +335,48 @@ def main(env_name, discrim_config, expert_config, full_data_dir, tf_par_conf,
         "min_iter_time_s": 10,
     }
     td3_conf = merge_dicts(td3_base_conf, td3_conf)
-    trainer = ApexTD3Trainer(env=env_name, config=td3_conf)
-    half_batch_size = max(1, discrim_config["batch_size"] // 2)
-    replay_sampler = LocalReplaySampler(
-        trainer.optimizer.replay_actors,
-        # use 1/2 of real batch size b/c when training discrim we mix with and
-        # other 1/2 expert samples
-        batch_size=half_batch_size)
-    dataset_size = half_batch_size
-    ds_range = np.arange(dataset_size)
-    demos = load_latest_demos(expert_config["expert_dir"])
-    real_obs_ds = demos['obs']
-    real_act_ds = demos['actions']
-    sess_conf = tf.ConfigProto(**tf_par_args)
-    with tf.Session(config=sess_conf) as sess:
-        sess.run(tf.global_variables_initializer())
-        reward_vars = ray.experimental.tf_utils.TensorFlowVariables(
-            discriminator.reward, sess)
-        discrim_updates = 0
-        itr = 0
-        while True:
-            # update trainer's reward weights
-            reward_weights = reward_vars.get_weights()
-            trainer.local_evaluator.foreach_trainable_policy(
-                lambda p, _: p.set_reward_weights(reward_weights))
+    trainer_actor = TrainerActor.remote(env_name, td3_conf)
+    replay_actors_handle = trainer_actor.get_replay_actors.remote()
+    discrim_actor = DiscriminatorActor.remote(env_name, discrim_config,
+                                              expert_config, td3_conf,
+                                              tf_par_args,
+                                              replay_actors_handle)
 
-            # train for a little while
-            step_result = trainer.train()
+    itr = 0
+    while True:
+        # update trainer's reward weights
+        # TODO: make the trainer do this automatically, all the time; will
+        # require a parameter server or something to make it work properly (the
+        # discriminator will be busy most of the time)
+        # TODO: also maybe I should be doing get_and_free (or whatever) instead
+        # of get() to minimise memory leaks? I still don't know how things get
+        # freed from the GCS.
+        reward_weights_handle = discrim_actor.get_reward_weights.remote()
+        gw_handle = trainer_actor.update_reward_weights.remote(
+            reward_weights_handle)
+        # make sure we update weights *before* we go on
+        ray.get(gw_handle)
 
-            skipped_discrim_update = True
-            for i in range(discrim_config["updates_per_epoch"]):
-                ma_batch = replay_sampler.get_batch()
-                if not ma_batch.policy_batches:
-                    # sometimes this happens at the beginning of training b/c
-                    # there are not enough samples in the replay buffer
-                    skipped_discrim_update = True
-                    continue
-                skipped_discrim_update = False
-                fake_batch = ma_batch.policy_batches["default_policy"]
-                fake_obs_batch = fake_batch['obs']
-                fake_act_batch = fake_batch['actions']
-                real_batch_inds = np.random.choice(ds_range,
-                                                   size=(half_batch_size, ))
-                label_batch = np.zeros((2 * half_batch_size, ))
-                label_batch[half_batch_size:] = 1.0
-                obs_batch = np.concatenate(
-                    [fake_obs_batch, real_obs_ds[real_batch_inds]], axis=0)
-                act_batch = np.concatenate(
-                    [fake_act_batch, real_act_ds[real_batch_inds]], axis=0)
+        # train for a little while
+        trainer_handle = trainer_actor.train_epoch.remote()
+        discrim_handle = discrim_actor.train_epoch.remote()
+        trainer_result, discrim_result = ray.get(
+            [trainer_handle, discrim_handle])
+        full_result = merge_dicts(trainer_result, discrim_result)
+        del full_result["config"]
 
-                # update the discriminator
-                discrim_updates += len(label_batch)
-                _, discrim_loss, discrim_acc = sess.run(
-                    [
-                        discriminator.update_op, discriminator.loss,
-                        discriminator.accuracy
-                    ],
-                    feed_dict={
-                        discriminator.obs_t: obs_batch,
-                        discriminator.act_t: act_batch,
-                        discriminator.is_real_t: label_batch,
-                        discriminator.is_training: True,
-                    })
+        # end of epoch, print stats
+        print('Epoch %d:' % itr)
+        print("  {}".format(pretty_print(full_result).replace("\n", "\n  ")))
 
-            # end of epoch, print stats
-            print('Epoch %d:' % itr)
-            if skipped_discrim_update:
-                print('\t[discrim] skipped, no samples')
-                discrim_loss = 0
-                discrim_acc = 0
-            else:
-                print('\t[discrim] Loss %.4g, accuracy %.4g' %
-                      (discrim_loss, discrim_acc))
-            print('\t[actor] Mean episode reward %.4g' %
-                  step_result['episode_reward_mean'])
-            full_result = merge_dicts(
-                step_result, {
-                    "discrim_loss": discrim_loss,
-                    "discrim_acc": discrim_acc,
-                    "discrim_updates": discrim_updates,
-                })
-            del full_result["config"]
-            stat_logger.on_result(full_result)
-            print("  {}".format(
-                pretty_print(full_result).replace("\n", "\n  ")))
-            # TODO: do this less often b/c each call has O(T) cost (it actually
-            # copies the whole stats file)
-            _run.add_artifact(stat_logger._file.name)
-            itr += 1
+        # also store in file
+        stat_logger.on_result(full_result)
+        # TODO: do this less often b/c each call has O(T) cost (it actually
+        # copies the whole stats file)
+        _run.add_artifact(stat_logger._file.name)
+
+        # next epoch!
+        itr += 1
 
 
 @ex.command
