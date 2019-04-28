@@ -1,0 +1,38 @@
+halfcheetah-apex-td3:
+    # Apex+TD3 on HalfCheetah-v2, but with only one worker (so only tests that
+    # APE-X actually runs; no real parallelism)
+    env: HalfCheetah-v2
+    run: APEX_TD3
+    stop:
+        episode_reward_mean: 10000
+        time_total_s: 21600 # 6 hours
+        timesteps_total: 1000000
+    config:
+        # === Model ===
+        actor_hiddens: [400, 300]
+        critic_hiddens: [400, 300]
+
+        # === Exploration ===
+        learning_starts: 10000
+        pure_exploration_steps: 10000
+
+        # === Evaluation ===
+        evaluation_interval: 1
+        evaluation_num_episodes: 5
+
+        # === APEX ===
+        optimizer:
+            max_weight_sync_delay: 400
+            num_replay_buffer_shards: 2
+        n_step: 1
+        num_gpus: 0
+        num_workers: 1
+        buffer_size: 1000000
+        train_batch_size: 128
+        sample_batch_size: 2
+        target_network_update_freq: 0
+        timesteps_per_iteration: 1000
+        exploration_gaussian_sigma: 0.1
+        per_worker_exploration: False
+        worker_side_prioritization: True
+        min_iter_time_s: 30

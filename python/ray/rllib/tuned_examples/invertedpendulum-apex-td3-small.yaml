@@ -1,0 +1,38 @@
+invertedpendulum-apex-td3:
+    # Apex+TD3 on InvertedPendulum-v2, optimised for tiny machines with ~4 cores
+    # (e.g your laptop). No real parallelism from APE-X
+    env: InvertedPendulum-v2
+    run: APEX_TD3
+    stop:
+        episode_reward_mean: 9999.9
+        time_total_s: 900 # 15 minutes
+        timesteps_total: 500000
+    config:
+        # === Model ===
+        actor_hiddens: [32, 32]
+        critic_hiddens: [32, 32]
+
+        # === Exploration ===
+        learning_starts: 10000
+        pure_exploration_steps: 10000
+
+        # === Evaluation ===
+        evaluation_interval: 1
+        evaluation_num_episodes: 5
+
+        # === APEX ===
+        optimizer:
+            max_weight_sync_delay: 400
+            num_replay_buffer_shards: 2
+        n_step: 1
+        num_gpus: 0
+        num_workers: 1
+        buffer_size: 1000000
+        train_batch_size: 128
+        sample_batch_size: 2
+        target_network_update_freq: 0
+        timesteps_per_iteration: 1000
+        exploration_gaussian_sigma: 0.1
+        per_worker_exploration: False
+        worker_side_prioritization: True
+        min_iter_time_s: 30

@@ -21,9 +21,11 @@ APEX_TD3_DEFAULT_CONFIG = merge_dicts(
         "num_workers": 32,
         # 10x size of normal TD3 buffer, since replacement is fast
         "buffer_size": 10000000,
+        # FIXME: figure out what we should actually set update freq to
+        # "target_network_update_freq": 50000,
+        "target_network_update_freq": 0,
         # 50,000 timesteps per epoch, with 10 epochs of pure exploration at the
         # beginning
-        "target_network_update_freq": 50000,
         "timesteps_per_iteration": 50000,
         "learning_starts": 500000,
         "pure_exploration_steps": 500000,

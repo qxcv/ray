@@ -300,7 +300,13 @@ class DQNTrainer(Trainer):
         logger.info("Evaluating current policy for {} episodes".format(
             self.config["evaluation_num_episodes"]))
         self.evaluation_ev.restore(self.local_evaluator.save())
-        self.evaluation_ev.foreach_policy(lambda p, _: p.set_epsilon(0))
+
+        def disable_exploration(p, _):
+            if hasattr('p', 'set_pure_exploration_phase'):
+                p.set_pure_exploration_phase(False)
+            p.set_epsilon(0)
+
+        self.evaluation_ev.foreach_policy(disable_exploration)
         for _ in range(self.config["evaluation_num_episodes"]):
             self.evaluation_ev.sample()
         metrics = collect_metrics(self.evaluation_ev)
