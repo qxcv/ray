@@ -78,6 +78,8 @@ class AsyncReplayOptimizer(PolicyOptimizer):
             replay_cls = BatchReplayActor
         else:
             replay_cls = ReplayActor
+        # XXX: this is going to be a bottleneck if I try to scale out
+        # optimisers.
         self.replay_actors = create_colocated(replay_cls, [
             num_replay_buffer_shards,
             learning_starts,

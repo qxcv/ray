@@ -8,7 +8,7 @@ Things left to implement:
   appropriately: discriminator training throughput, TD3 update throughput, and
   TD3 sampling throughput.
 - Switch from TD3 to APEX-TD3 during GAIL. Requires new TD3 config, probably
-  copied from my git stash on svm.
+  copied from my `git stash` on svm.
 - Train expert policies for Ant-v2 and Hopper-v2. That should be sufficient for
   the report, once combined with InvertedPendulum-v2 and HalfCheetah-v2.
 - Move to distributed SGD for the reward function.
@@ -16,9 +16,14 @@ Things left to implement:
 - Benchmark all methods with increasing levels of parallelism. Create some plots
   that I can put in slides.
 
-
 Handy notes:
 
 - I can use TimerStat() to record how long things take. A lot of RLLib is
   already instrumented like that; see `async_replay_optimizer.py` for an
   example.
+- The async replay optimiser uses create_colocated to allocate replay shards *on
+  the same machine as the caller*. It's not clear to me what this achieves
+  (although it must achieve something, because the authors know their shit).
+
+
+Questions to ask
