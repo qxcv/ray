@@ -280,16 +280,19 @@ class ReplayActor(object):
                         row["new_obs"], row["dones"], row["weights"])
         self.num_added += batch.count
 
-    def replay(self):
-        if self.num_added < self.replay_starts:
+    def replay(self, force=False, batch_size=None):
+        if self.num_added < self.replay_starts and not force:
             return None
+
+        if not batch_size:
+            batch_size = self.train_batch_size
 
         with self.replay_timer:
             samples = {}
             for policy_id, replay_buffer in self.replay_buffers.items():
                 (obses_t, actions, rewards, obses_tp1, dones, weights,
                  batch_indexes) = replay_buffer.sample(
-                     self.train_batch_size, beta=self.prioritized_replay_beta)
+                     batch_size, beta=self.prioritized_replay_beta)
                 samples[policy_id] = SampleBatch({
                     "obs": obses_t,
                     "actions": actions,
@@ -299,7 +302,7 @@ class ReplayActor(object):
                     "weights": weights,
                     "batch_indexes": batch_indexes
                 })
-            return MultiAgentBatch(samples, self.train_batch_size)
+            return MultiAgentBatch(samples, batch_size)
 
     def update_priorities(self, prio_dict):
         with self.update_priorities_timer:
@@ -357,8 +360,8 @@ class BatchReplayActor(object):
         while self.cur_size > self.buffer_size:
             self.cur_size -= self.buffer.pop(0).count
 
-    def replay(self):
-        if self.num_added < self.replay_starts:
+    def replay(self, force=False):
+        if self.num_added < self.replay_starts and not force:
             return None
         return random.choice(self.buffer)
 

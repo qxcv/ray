@@ -1,5 +1,6 @@
 """A distributed implementation of GAIL using the TD3 optimizer with APE-X."""
 
+import collections
 import os
 
 # TODO: only set these during benchmarking
@@ -17,7 +18,11 @@ from ray.rllib.evaluation.metrics import collect_metrics  # noqa: E402
 from ray.rllib.evaluation.sample_batch import SampleBatch  # noqa: E402
 from ray.rllib.offline.json_writer import JsonWriter  # noqa: E402
 from ray.rllib.offline.json_reader import JsonReader  # noqa: E402
+from ray.rllib.optimizers.async_replay_optimizer \
+    import REPLAY_QUEUE_DEPTH  # noqa: E402
 from ray.rllib.models import ModelCatalog  # noqa: E402
+from ray.rllib.utils.memory import ray_get_and_free  # noqa: E402
+from ray.rllib.utils.actors import TaskPool  # noqa: E402
 from ray.tune.logger import CSVLogger, pretty_print  # noqa: E402
 from ray.tune.util import merge_dicts  # noqa: E402
 
@@ -27,6 +32,57 @@ from sacred.observers import FileStorageObserver  # noqa: E402
 import tensorflow as tf  # noqa: E402
 
 ex = Experiment('gail')
+
+
+class LocalReplaySampler(object):
+    """Simple class to keep pulling experience batches out of some replay
+    actors. NOT THREAD-SAFE OR MULTIPROCESSING-SAFE! You're meant to have one
+    of these per discriminator training process/thread."""
+
+    def __init__(self, replay_actors, batch_size):
+        self.replay_actors = replay_actors
+        self.batch_size = batch_size
+        # we lazily create replay_tasks so that they get spawned *after*
+        # training starts; otherwise the first few sampled batches are empty
+        # b/c there's nothing the replay buffer :(
+        self.replay_tasks = None
+        # queued batches
+        self.batch_queue = collections.deque()
+
+    def _add_replay_task(self, ra):
+        if self.replay_tasks is None:
+            self._make_replay_tasks()
+        self.replay_tasks.add(
+            ra, ra.replay.remote(force=True, batch_size=self.batch_size))
+
+    def _make_replay_tasks(self):
+        if self.replay_tasks is None:
+            self.replay_tasks = TaskPool()
+            for ra in self.replay_actors:
+                for _ in range(REPLAY_QUEUE_DEPTH):
+                    self._add_replay_task(ra)
+
+    def _refresh(self, blocking=False):
+        # FIXME: this code is partially copied from AsyncReplayOptimizer; I
+        # should unify the two to de-duplicate (maybe use this class in both
+        # cases)
+        if self.replay_tasks is None:
+            self._make_replay_tasks()
+        for ra, replay in self.replay_tasks.completed(blocking_wait=blocking):
+            self._add_replay_task(ra)
+            samples = ray_get_and_free(replay)
+            # Defensive copy against plasma crashes, see #2610 #3452
+            self.batch_queue.append((ra, samples and samples.copy()))
+
+    def get_batch(self):
+        if len(self.batch_queue) == 0:
+            self._refresh(blocking=True)
+            result = self.batch_queue.popleft()
+        else:
+            result = self.batch_queue.popleft()
+            self._refresh(blocking=False)
+        _, batch = result
+        return batch
 
 
 class Discriminator(object):
@@ -113,8 +169,7 @@ def cfg():
         "expert_subdir": 'demos',
         "output_timesteps": 10000,
     }
-    # TODO: decide what to do with this...
-    td3_conf = {}
+    td3_conf = {}  # noqa: F841
     tf_par_conf = {  # noqa: F841
         "inter_par_threads": 1,
         "intra_par_threads": 1,
@@ -173,14 +228,16 @@ def main(env_name, discrim_config, expert_config, full_data_dir, tf_par_conf,
         "tf_session_args": tf_par_args,
         "local_evaluator_tf_session_args": tf_par_args,
         "num_gpus": 0,
-        "num_workers": 1,
+        "min_iter_time_s": 10,
     }
     td3_conf = merge_dicts(td3_base_conf, td3_conf)
-    # trainer = TD3Trainer(env=env_name, config=td3_conf)
     trainer = ApexTD3Trainer(env=env_name, config=td3_conf)
-    replay = trainer.optimizer.replay_buffers['default_policy']
-    # stupid fake shit dataset to feed discriminator
     half_batch_size = max(1, discrim_config["batch_size"] // 2)
+    replay_sampler = LocalReplaySampler(
+        trainer.optimizer.replay_actors,
+        # use 1/2 of real batch size b/c when training discrim we mix with and
+        # other 1/2 expert samples
+        batch_size=half_batch_size)
     dataset_size = half_batch_size
     ds_range = np.arange(dataset_size)
     demos = load_latest_demos(expert_config["expert_dir"])
@@ -202,11 +259,18 @@ def main(env_name, discrim_config, expert_config, full_data_dir, tf_par_conf,
             # train for a little while
             step_result = trainer.train()
 
+            skipped_discrim_update = True
             for i in range(discrim_config["updates_per_epoch"]):
-                # pull some fake data out of the trainer's replay buffer & join
-                # it with some real data
-                fake_obs_batch, fake_act_batch, _, _, _ \
-                    = replay.sample(half_batch_size)
+                ma_batch = replay_sampler.get_batch()
+                if not ma_batch.policy_batches:
+                    # sometimes this happens at the beginning of training b/c
+                    # there are not enough samples in the replay buffer
+                    skipped_discrim_update = True
+                    continue
+                skipped_discrim_update = False
+                fake_batch = ma_batch.policy_batches["default_policy"]
+                fake_obs_batch = fake_batch['obs']
+                fake_act_batch = fake_batch['actions']
                 real_batch_inds = np.random.choice(ds_range,
                                                    size=(half_batch_size, ))
                 label_batch = np.zeros((2 * half_batch_size, ))
@@ -231,18 +295,28 @@ def main(env_name, discrim_config, expert_config, full_data_dir, tf_par_conf,
                     })
 
             # end of epoch, print stats
-            print('Epoch %d:\n\t[discrim] Loss %.4g, accuracy %.4g\n\t'
-                  '[actor] Mean episode reward %.4g' %
-                  (itr, discrim_loss, discrim_acc,
-                   step_result['episode_reward_mean']))
-            full_result = merge_dicts(step_result, {
-                "discrim_loss": discrim_loss,
-                "discrim_acc": discrim_acc,
-                "discrim_updates": discrim_updates,
-            })
+            print('Epoch %d:' % itr)
+            if skipped_discrim_update:
+                print('\t[discrim] skipped, no samples')
+                discrim_loss = 0
+                discrim_acc = 0
+            else:
+                print('\t[discrim] Loss %.4g, accuracy %.4g' %
+                      (discrim_loss, discrim_acc))
+            print('\t[actor] Mean episode reward %.4g' %
+                  step_result['episode_reward_mean'])
+            full_result = merge_dicts(
+                step_result, {
+                    "discrim_loss": discrim_loss,
+                    "discrim_acc": discrim_acc,
+                    "discrim_updates": discrim_updates,
+                })
             del full_result["config"]
             stat_logger.on_result(full_result)
-            # TODO: do this less often b/c each call has O(T) cost
+            print("  {}".format(
+                pretty_print(full_result).replace("\n", "\n  ")))
+            # TODO: do this less often b/c each call has O(T) cost (it actually
+            # copies the whole stats file)
             _run.add_artifact(stat_logger._file.name)
             itr += 1
 

@@ -16,24 +16,29 @@ APEX_TD3_DEFAULT_CONFIG = merge_dicts(
                 "num_replay_buffer_shards": 4,
                 "debug": False
             }),
-        "n_step": 3,
+        # empirically I haven't found that k-step returns help much on Mujoco
+        # envs, so disabling for simplicity
+        "n_step": 1,
         "num_gpus": 0,
         "num_workers": 32,
-        # 10x size of normal TD3 buffer, since replacement is fast
+        # 10x size of normal TD3 buffer, since replacement is super super fast
+        # on most envs
         "buffer_size": 10000000,
-        # FIXME: figure out what we should actually set update freq to
-        # "target_network_update_freq": 50000,
-        "target_network_update_freq": 0,
+        # this doesn't really matter any more because I'm doing a target update
+        # on every policy update
+        # TODO: figure out whether once-per-timestep is even a good idea,
+        # especially in the distributed SGD setting
+        "target_network_update_freq": int(1e10),
         # 50,000 timesteps per epoch, with 10 epochs of pure exploration at the
         # beginning
-        "timesteps_per_iteration": 50000,
-        "learning_starts": 500000,
-        "pure_exploration_steps": 500000,
-        "train_batch_size": 512,
-        "sample_batch_size": 25,
+        "timesteps_per_iteration": 30000,
+        "learning_starts": 300000,
+        "pure_exploration_steps": 300000,
+        "train_batch_size": 256,
+        "sample_batch_size": 20,
         "per_worker_exploration": False,
         "worker_side_prioritization": True,
-        "min_iter_time_s": 5,
+        "min_iter_time_s": 30,
     },
 )
 
