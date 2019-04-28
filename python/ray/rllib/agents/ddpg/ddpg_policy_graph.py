@@ -246,7 +246,8 @@ class DDPGPolicyGraph(DDPGPostprocessing, TFPolicyGraph):
         # update_target_fn will be called periodically to copy Q network to
         # target Q network
         self.tau_value = config.get("tau")
-        self.tau = tf.placeholder(tf.float32, (), name="tau")
+        self.tau = tf.placeholder_with_default(
+            tf.constant(self.tau_value, dtype=tf.float32), (), name="tau")
         update_target_expr = []
         for var, var_target in zip(
                 sorted(self.q_func_vars, key=lambda v: v.name),
@@ -328,8 +329,13 @@ class DDPGPolicyGraph(DDPGPostprocessing, TFPolicyGraph):
             tf.mod(self.global_step, self.config["policy_delay"]), 0)
 
         def make_apply_op():
-            return self._actor_optimizer.apply_gradients(
-                self._actor_grads_and_vars)
+            return tf.group(
+                self._actor_optimizer.apply_gradients(
+                    self._actor_grads_and_vars),
+                # XXX HACK HACK HACK
+                # I need to change the way this update is done *for good*, not
+                # just with this one hack.
+                self.update_target_expr)
 
         actor_op = tf.cond(should_apply_actor_opt,
                            true_fn=make_apply_op,
