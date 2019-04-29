@@ -15,6 +15,7 @@ import numpy as np  # noqa: E402
 
 import ray  # noqa: E402
 from ray import tune  # noqa: E402
+from ray.experimental import named_actors  # noqa: E402
 from ray.rllib.agents.ddpg import ApexTD3Trainer, TD3Trainer  # noqa: E402
 from ray.rllib.evaluation.metrics import collect_metrics  # noqa: E402
 from ray.rllib.evaluation.sample_batch import SampleBatch  # noqa: E402
@@ -39,16 +40,17 @@ ex = Experiment('gail')
 @ray.remote(num_cpus=1)
 class DiscriminatorActor(object):
     def __init__(self, env_name, disc_config, expert_config, td3_conf,
-                 tf_par_args, replay_actors):
+                 tf_par_args, param_server, replay_actors):
         env = gym.make(env_name)
-        self.discriminator = Discriminator(disc_config,
-                                           env.observation_space,
+        self.discriminator = Discriminator(disc_config, env.observation_space,
                                            env.action_space)
         del env
         self.disc_updates = 0
         self.disc_samples_seen = 0
         self.min_iter_time_s = td3_conf["min_iter_time_s"]
         self.min_iter_steps = disc_config["updates_per_epoch"]
+        self.rew_update_period = disc_config["sync_at_least_every"]
+        self._wait_handle = None
 
         self.half_batch_size = max(1, disc_config["batch_size"] // 2)
         dataset_size = self.half_batch_size
@@ -56,6 +58,7 @@ class DiscriminatorActor(object):
         self.ds_range = np.arange(dataset_size)
         self.real_obs_ds = demos['obs']
         self.real_act_ds = demos['actions']
+        self.param_server = param_server
 
         sess_conf = tf.ConfigProto(**tf_par_args)
         self.sess = tf.Session(config=sess_conf)
@@ -78,8 +81,11 @@ class DiscriminatorActor(object):
         min_steps = self.min_iter_steps
         min_time = self.min_iter_time_s
         while steps < min_steps or time.time() - start_time < min_time:
+            if (steps + 1) % self.rew_update_period == 0:
+                self.push_weights()
             disc_loss, disc_acc = self._train_step()
             steps += 1
+        self.push_weights()
         return {
             "disc_loss": disc_loss,
             "disc_acc": disc_acc,
@@ -89,6 +95,15 @@ class DiscriminatorActor(object):
 
     def get_reward_weights(self):
         return self.reward_vars.get_weights()
+
+    def push_weights(self):
+        if self._wait_handle is not None:
+            # wait for previous request to finish
+            ray_get_and_free(self._wait_handle)
+            self._wait_handle = None
+        # launch a new push asynchronously
+        weights = self.get_reward_weights()
+        self._wait_handle = self.param_server.set_weights.remote(weights)
 
     def _train_step(self):
         ma_batch = self.replay_sampler.get_batch()
@@ -125,6 +140,22 @@ class DiscriminatorActor(object):
         return disc_loss, disc_acc
 
 
+@ray.remote(num_cpus=0)
+class DiscriminatorParameterServer(object):
+    """Stores parameters for the discriminator in a commonly-accessible
+    place."""
+
+    def __init__(self):
+        self.weights = None
+
+    def set_weights(self, weights):
+        self.weights = weights
+
+    def get_weights(self):
+        # might be None initially
+        return self.weights
+
+
 @ray.remote(num_cpus=1)
 class TrainerActor(object):
     def __init__(self, env_name, td3_conf):
@@ -135,10 +166,6 @@ class TrainerActor(object):
 
     def train_epoch(self):
         return self.trainer.train()
-
-    def update_reward_weights(self, new_weights):
-        self.trainer.local_evaluator.foreach_trainable_policy(
-            lambda p, _: p.set_reward_weights(new_weights))
 
 
 class LocalReplaySampler(object):
@@ -258,6 +285,21 @@ class Discriminator(object):
         return out_value
 
 
+def load_latest_demos(demo_dir):
+    demo_paths = []
+    for file_name in os.listdir(demo_dir):
+        if os.path.splitext(file_name)[-1].lower() == '.json':
+            demo_path = os.path.join(demo_dir, file_name)
+            demo_paths.append(demo_path)
+    # choose the latest one just by sorting names
+    demo_path = sorted(demo_paths)[-1]
+    # now read samples back out
+    # this api is so fucked
+    demo_reader = JsonReader(demo_path)
+    demos = SampleBatch.concat_samples(list(demo_reader))
+    return demos
+
+
 @ex.config
 def cfg():
     env_name = 'InvertedPendulum-v2'  # noqa: F841
@@ -265,6 +307,9 @@ def cfg():
         "lr": 1e-3,
         "batch_size": 128,
         "updates_per_epoch": 50,
+        # update shared weights at least once every time we take this many
+        # steps
+        "sync_at_least_every": 50,
         "model": {
             "fcnet_hiddens": [128, 128],
             "fcnet_activation": "relu"
@@ -281,12 +326,6 @@ def cfg():
     td3_conf = {  # noqa: F841
         "evaluation_interval": 10,
         "evaluation_num_episodes": 5,
-
-        # XXX these are all very naughty settings
-        # "num_workers": 1,
-        # "timesteps_per_iteration": 1000,
-        # "learning_starts": 10000,
-        # "pure_exploration_steps": 10000,
     }
     tf_par_conf = {  # noqa: F841
         "inter_par_threads": 1,
@@ -305,21 +344,6 @@ def fix_cfg_relpaths(config, command_name, logger):
                 full_data_dir, config["expert_config"]["expert_subdir"])
         }
     }
-
-
-def load_latest_demos(demo_dir):
-    demo_paths = []
-    for file_name in os.listdir(demo_dir):
-        if os.path.splitext(file_name)[-1].lower() == '.json':
-            demo_path = os.path.join(demo_dir, file_name)
-            demo_paths.append(demo_path)
-    # choose the latest one just by sorting names
-    demo_path = sorted(demo_paths)[-1]
-    # now read samples back out
-    # this api is so fucked
-    demo_reader = JsonReader(demo_path)
-    demos = SampleBatch.concat_samples(list(demo_reader))
-    return demos
 
 
 @ex.main
@@ -345,32 +369,25 @@ def main(env_name, discrim_config, expert_config, full_data_dir, tf_par_conf,
         "min_iter_time_s": 1,
     }
     td3_conf = merge_dicts(td3_base_conf, td3_conf)
+    disc_param_server = DiscriminatorParameterServer.remote()
+    named_actors.register_actor("global_reward_params", disc_param_server)
     trainer_actor = TrainerActor.remote(env_name, td3_conf)
     replay_actors_handle = trainer_actor.get_replay_actors.remote()
     discrim_actor = DiscriminatorActor.remote(env_name, discrim_config,
                                               expert_config, td3_conf,
-                                              tf_par_args,
+                                              tf_par_args, disc_param_server,
                                               replay_actors_handle)
 
     itr = 0
     while True:
-        # update trainer's reward weights
-        # TODO: make the trainer do this automatically, all the time; will
-        # require a parameter server or something to make it work properly (the
-        # discriminator will be busy most of the time)
-        # TODO: also maybe I should be doing get_and_free (or whatever) instead
-        # of get() to minimise memory leaks? I still don't know how things get
-        # freed from the GCS.
-        reward_weights_handle = discrim_actor.get_reward_weights.remote()
-        gw_handle = trainer_actor.update_reward_weights.remote(
-            reward_weights_handle)
-        # make sure we update weights *before* we go on
-        ray.get(gw_handle)
+        # TODO: rewrite lots of things to use get_and_free; it seems like I
+        # have some memory leaks in my concurrent code (although that *may* be
+        # just due to big replay size)
 
         # train for a little while
         trainer_handle = trainer_actor.train_epoch.remote()
         discrim_handle = discrim_actor.train_epoch.remote()
-        trainer_result, discrim_result = ray.get(
+        trainer_result, discrim_result = ray_get_and_free(
             [trainer_handle, discrim_handle])
         full_result = merge_dicts(trainer_result, discrim_result)
         del full_result["config"]

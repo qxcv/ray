@@ -159,6 +159,9 @@ DEFAULT_CONFIG = with_common_config({
     # Dict describing reward model. Set to None or empty dict to disable reward
     # model & just use normal env reward instead.
     "reward_model": None,
+    # how many batches should we have to process learn on before pulling down
+    # new reward params?
+    "reward_update_freq": 20,
 })
 # __sphinx_doc_end__
 # yapf: enable

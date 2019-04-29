@@ -6,12 +6,14 @@ import logging
 import time
 
 from ray import tune
+from ray.experimental import named_actors
 from ray.rllib import optimizers
 from ray.rllib.agents.trainer import Trainer, with_common_config
 from ray.rllib.agents.dqn.dqn_policy_graph import DQNPolicyGraph
 from ray.rllib.evaluation.metrics import collect_metrics
 from ray.rllib.evaluation.sample_batch import DEFAULT_POLICY_ID
 from ray.rllib.utils.annotations import override
+from ray.rllib.utils.memory import ray_get_and_free
 from ray.rllib.utils.schedules import ConstantSchedule, LinearSchedule
 
 logger = logging.getLogger(__name__)
@@ -132,6 +134,11 @@ DEFAULT_CONFIG = with_common_config({
     "worker_side_prioritization": False,
     # Prevent iterations from going lower than this time span
     "min_iter_time_s": 1,
+
+    # === GAIL hacks ===
+    # how many batches should we have to process learn on before pulling down
+    # new reward params?
+    "reward_update_freq": 20,
 })
 # __sphinx_doc_end__
 # yapf: enable
@@ -238,6 +245,10 @@ class DQNTrainer(Trainer):
 
         self.last_target_update_ts = 0
         self.num_target_updates = 0
+        # this is measured in training time steps (i.e steps used for optimiser
+        # updates) rather than sampled time steps
+        self.last_reward_update_tts = 0
+        self.num_reward_updates = 0
 
     @override(Trainer)
     def _train(self):
@@ -260,6 +271,7 @@ class DQNTrainer(Trainer):
                ) or time.time() - start < self.config["min_iter_time_s"]:
             self.optimizer.step()
             self.update_target_if_needed()
+            self.update_reward_if_needed()
 
         if self.config["per_worker_exploration"]:
             # Only collect metrics from the third of workers with lowest eps
@@ -275,6 +287,7 @@ class DQNTrainer(Trainer):
                 "min_exploration": min(exp_vals),
                 "max_exploration": max(exp_vals),
                 "num_target_updates": self.num_target_updates,
+                "num_reward_updates": self.num_reward_updates,
             }, **self.optimizer.stats()))
 
         if self.config["evaluation_interval"]:
@@ -291,6 +304,25 @@ class DQNTrainer(Trainer):
                 lambda p, _: p.update_target())
             self.last_target_update_ts = self.global_timestep
             self.num_target_updates += 1
+
+    def update_reward_if_needed(self):
+        if not self.config["reward_model"]:
+            return
+        elapsed = self.optimizer.num_steps_trained \
+            - self.last_reward_update_tts
+        target_elapsed = self.config["reward_update_freq"] \
+            * self.config["train_batch_size"]
+        if not elapsed > target_elapsed:
+            return
+        if not hasattr(self, '_reward_actor'):
+            self._reward_actor \
+                = named_actors.get_actor("global_reward_params")
+        weight_req = self._reward_actor.get_weights.remote()
+        new_weights = ray_get_and_free(weight_req)
+        self.num_reward_updates += 1
+        self.local_evaluator.foreach_trainable_policy(
+            lambda p, _: p.set_reward_weights(new_weights))
+        self.last_reward_update_tts = self.optimizer.num_steps_trained
 
     @property
     def global_timestep(self):
