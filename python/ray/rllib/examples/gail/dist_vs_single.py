@@ -98,13 +98,15 @@ class ExperimentDiscriminator(object):
 
 @ray.remote(num_cpus=1)
 class DistSGDActor():
-    def __init__(self, good_demos, bad_demos, cores, obs_space, act_space):
+    def __init__(self, good_demos, bad_demos, cores, obs_space, act_space,
+                 disc_config):
         # assume there's no latency to get data
         # TODO: make more realistic experiment in which I pull data out of a
         # single replay shard
         self.good_demos = good_demos
         self.bad_demos = bad_demos
-        self.sess, self.disc = make_sess_disc(obs_space, act_space, cores)
+        self.sess, self.disc = make_sess_disc(obs_space, act_space, cores,
+                                              disc_config)
 
     def get_grads(self, minibatch_size):
         obs_batch, act_batch, label_batch = get_obs_act_label_batch(
@@ -175,7 +177,7 @@ def do_dist_sgd(args, obs_space, act_space, disc_config):
     bad_demos_handle = ray.put(args.bad_demos)
     workers = [
         DistSGDActor.remote(good_demos_handle, bad_demos_handle, 1, obs_space,
-                            act_space) for i in range(args.cores)
+                            act_space, disc_config) for i in range(args.cores)
     ]
     # we actually just use this for Adam updates
     master_sess, master_disc = make_sess_disc(obs_space, act_space, args.cores,
