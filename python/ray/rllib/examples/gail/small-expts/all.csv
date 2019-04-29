@@ -1,0 +1,2 @@
+type,hiddens,batch_size,cores,gpus,samples_per_s,disc_final_loss,disc_final_acc,train_time
+single,"128,128",128,1,0,92509.81446732818,0.14649223,1.0,60
