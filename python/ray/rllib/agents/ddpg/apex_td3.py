@@ -32,8 +32,8 @@ APEX_TD3_DEFAULT_CONFIG = merge_dicts(
         # 50,000 timesteps per epoch, with 10 epochs of pure exploration at the
         # beginning
         "timesteps_per_iteration": 30000,
-        "learning_starts": 300000,
-        "pure_exploration_steps": 300000,
+        "learning_starts": 100000,
+        "pure_exploration_steps": 100000,
         "train_batch_size": 256,
         "sample_batch_size": 20,
         "per_worker_exploration": False,

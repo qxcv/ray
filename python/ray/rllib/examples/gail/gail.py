@@ -4,7 +4,8 @@ import collections
 import os
 import time
 
-# TODO: only set these during benchmarking
+# TODO: add a check to make sure these are at correct value; warn or error out
+# if not
 # os.environ["MKL_NUM_THREADS"] = str(1)
 # os.environ["OMP_NUM_THREADS"] = str(1)
 
@@ -231,6 +232,8 @@ class Discriminator(object):
         self.loss = tf.reduce_mean(
             tf.nn.sigmoid_cross_entropy_with_logits(labels=self.is_real_t,
                                                     logits=self.logits))
+        reg = tf.contrib.layers.l1_regularizer(1e-2)
+        self.loss += sum(reg(v) for v in discrim_train_vars)
         real_labels = self.is_real_t > 0.5
         out_labels = self.logits > 0
         self.accuracy = tf.reduce_mean(
@@ -276,8 +279,14 @@ def cfg():
         "output_timesteps": 10000,
     }
     td3_conf = {  # noqa: F841
-        "evaluation_interval": 5,
+        "evaluation_interval": 10,
         "evaluation_num_episodes": 5,
+
+        # XXX these are all very naughty settings
+        # "num_workers": 1,
+        # "timesteps_per_iteration": 1000,
+        # "learning_starts": 10000,
+        # "pure_exploration_steps": 10000,
     }
     tf_par_conf = {  # noqa: F841
         "inter_par_threads": 1,
@@ -332,7 +341,8 @@ def main(env_name, discrim_config, expert_config, full_data_dir, tf_par_conf,
         "tf_session_args": tf_par_args,
         "local_evaluator_tf_session_args": tf_par_args,
         "num_gpus": 0,
-        "min_iter_time_s": 10,
+        "timesteps_per_iteration": 5000,
+        "min_iter_time_s": 1,
     }
     td3_conf = merge_dicts(td3_base_conf, td3_conf)
     trainer_actor = TrainerActor.remote(env_name, td3_conf)

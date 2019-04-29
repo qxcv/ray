@@ -581,21 +581,24 @@ class DDPGPolicyGraph(DDPGPostprocessing, TFPolicyGraph):
 
         # compute the error (potentially clipped)
         if twin_q:
-            td_error = q_t_selected - q_t_selected_target
+            single_td_error = q_t_selected - q_t_selected_target
             twin_td_error = twin_q_t_selected - q_t_selected_target
-            td_error = td_error + twin_td_error
             if use_huber:
-                errors = _huber_loss(td_error, huber_threshold) \
+                errors = _huber_loss(single_td_error, huber_threshold) \
                     + _huber_loss(twin_td_error, huber_threshold)
             else:
-                errors = 0.5 * tf.square(td_error) + 0.5 * tf.square(
-                    twin_td_error)
+                errors = 0.5 * tf.square(single_td_error) \
+                         + 0.5 * tf.square(twin_td_error)
+            # TODO: is this even remotely the right thing to do here?
+            # td_error = single_td_error + twin_td_error
+            td_error = (tf.abs(single_td_error) + tf.abs(twin_td_error)) / 2
         else:
             td_error = q_t_selected - q_t_selected_target
             if use_huber:
                 errors = _huber_loss(td_error, huber_threshold)
             else:
                 errors = 0.5 * tf.square(td_error)
+            td_error = tf.abs(td_error)
 
         critic_loss = tf.reduce_mean(self.importance_weights * errors)
         actor_loss = -tf.reduce_mean(q_t_det_policy)

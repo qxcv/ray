@@ -1,0 +1,8 @@
+#!/bin/bash
+
+# remove all concurrency confounders; we want complete control
+export MKL_NUM_THREADS=1
+export OMP_NUM_THREADS=1
+export CUDA_VISIBLE_DEVICES=""
+
+python3 gail.py "$@"
