@@ -2,6 +2,8 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import warnings
+
 from gym.spaces import Box
 import numpy as np
 import tensorflow as tf
@@ -246,8 +248,10 @@ class DDPGPolicyGraph(DDPGPostprocessing, TFPolicyGraph):
         # update_target_fn will be called periodically to copy Q network to
         # target Q network
         self.tau_value = config.get("tau")
-        self.tau = tf.placeholder_with_default(
-            tf.constant(self.tau_value, dtype=tf.float32), (), name="tau")
+        self.tau = tf.placeholder_with_default(tf.constant(self.tau_value,
+                                                           dtype=tf.float32),
+                                               (),
+                                               name="tau")
         update_target_expr = []
         for var, var_target in zip(
                 sorted(self.q_func_vars, key=lambda v: v.name),
@@ -486,7 +490,8 @@ class DDPGPolicyGraph(DDPGPostprocessing, TFPolicyGraph):
                     "is_training": self._get_is_training_placeholder()
                 },
                 obs_space=observation_space,
-                action_space=action_space, num_outputs=1,
+                action_space=action_space,
+                num_outputs=1,
                 options=self.config["reward_model"])
         rew_logits = tf.squeeze(rew_model.outputs, axis=1)
         # give agent reward of -log(1-sigmoid(logits))=softplus(logits)
@@ -669,6 +674,11 @@ class DDPGPolicyGraph(DDPGPostprocessing, TFPolicyGraph):
 
     def set_reward_weights(self, new_weights):
         # TODO: consider doing a moving average update or some shit
+        if new_weights is None:
+            warnings.warn(
+                "Tried to .set_reward_weights() with weights equal to None;"
+                "ignoring, since param server probably not spooled up")
+            return
         self.reward_variables.set_weights(new_weights)
 
     def set_epsilon(self, epsilon):
