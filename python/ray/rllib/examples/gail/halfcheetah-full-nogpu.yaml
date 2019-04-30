@@ -1,0 +1,19 @@
+data_dir: data
+env_name: HalfCheetah-v2
+tf_configs:
+  discrim:
+    gpu_num: null
+    tf_threads: 8
+  td3_local_learner:
+    gpu_num: null
+    tf_threads: 8
+  td3_defaults:
+    gpu_num: null
+    tf_threads: 1
+td3_conf:
+  num_workers: 16
+expert_config:
+  expert_subdir: demos
+  output_timesteps: 10000
+  train_timesteps: 1000000
+seed: 122900136

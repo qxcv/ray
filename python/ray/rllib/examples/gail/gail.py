@@ -37,7 +37,7 @@ import tensorflow as tf  # noqa: E402
 ex = Experiment('gail')
 
 
-@ray.remote(num_cpus=1)
+@ray.remote(num_cpus=1, num_gpus=1)
 class DiscriminatorActor(object):
     def __init__(self, env_name, disc_config, expert_config, td3_conf,
                  tf_par_args, param_server, replay_actors):
@@ -156,7 +156,7 @@ class DiscriminatorParameterServer(object):
         return self.weights
 
 
-@ray.remote(num_cpus=1)
+@ray.remote(num_cpus=1, num_gpus=1)
 class TrainerActor(object):
     def __init__(self, env_name, td3_conf):
         self.trainer = ApexTD3Trainer(env=env_name, config=td3_conf)
@@ -345,11 +345,12 @@ def cfg():
         "output_timesteps": 10000,
     }
     td3_conf = {  # noqa: F841
-        "evaluation_interval": 10,
+        "evaluation_interval": 5,
         "evaluation_num_episodes": 5,
         "timesteps_per_iteration": 5000,
         "min_iter_time_s": 30,
         "train_batch_size": 256,
+        "num_workers": 32,
     }
 
 
@@ -375,7 +376,9 @@ def make_tf_config_args(tf_threads=None, gpu_num=None):
     if gpu_num is None:
         cproto_args['gpu_options'] = dict(visible_device_list="")
     else:
-        cproto_args['gpu_options'] = dict(visible_devices=str(gpu_num),
+        # TODO: this is stupid because it conflicts with Ray's management;
+        # should just use what Ray gives me (except when disabling dynamically)
+        cproto_args['gpu_options'] = dict(visible_device_list=str(gpu_num),
                                           allow_growth=True)
     return cproto_args
 
@@ -388,7 +391,7 @@ def main(env_name, discrim_config, expert_config, full_data_dir, tf_configs,
     out_dir = os.path.join(full_data_dir, "gail_run_%s" % _run._id)
     os.makedirs(out_dir, exist_ok=True)
     stat_logger = CSVLogger(config=_config, logdir=out_dir)
-    ray.init()
+    ray.init(num_cpus=38, num_gpus=2)
     # algo config dict
     td3_base_conf = {
         "reward_model": discrim_config["model"],

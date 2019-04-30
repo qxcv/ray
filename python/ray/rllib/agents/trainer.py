@@ -137,9 +137,9 @@ COMMON_CONFIG = {
             "allow_growth": True,
         },
         "log_device_placement": False,
-        "device_count": {
-            "CPU": 1
-        },
+        # "device_count": {
+        #     "CPU": 1
+        # },
         "allow_soft_placement": True,  # required by PPO multi-gpu
     },
     # Override the following tf session args on the local evaluator
@@ -148,6 +148,7 @@ COMMON_CONFIG = {
         # since that can cause crashes with many concurrent drivers.
         "intra_op_parallelism_threads": 8,
         "inter_op_parallelism_threads": 8,
+        "log_device_placement": False,
         "gpu_options": {
             # Can set to string list (e.g "0,3") to enable only subset of
             # visible GPUs. See TF docs for semantics.
