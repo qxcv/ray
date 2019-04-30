@@ -218,6 +218,10 @@ class PrioritizedReplayBuffer(ReplayBuffer):
         encoded_sample = self._encode_sample(idxes)
         return tuple(list(encoded_sample) + [weights, idxes])
 
+    def sample_uniform(self, batch_size):
+        """Sample uniformly from buffer, without prioritisation."""
+        return super().sample(batch_size)
+
     @DeveloperAPI
     def update_priorities(self, idxes, priorities):
         """Update priorities of sampled transitions.

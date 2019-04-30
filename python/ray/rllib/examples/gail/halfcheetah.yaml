@@ -1,12 +1,5 @@
 data_dir: data
 discrim_config:
-  batch_size: 128
-  lr: 0.001
-  model:
-    fcnet_activation: relu
-    fcnet_hiddens:
-    - 128
-    - 128
   updates_per_epoch: 50
 env_name: HalfCheetah-v2
 expert_config:

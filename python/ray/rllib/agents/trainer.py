@@ -131,7 +131,9 @@ COMMON_CONFIG = {
         # note: overriden by `local_evaluator_tf_session_args`
         "intra_op_parallelism_threads": 2,
         "inter_op_parallelism_threads": 2,
+        # XXX this seems to be totally ignored?
         "gpu_options": {
+            "visible_device_list": None,
             "allow_growth": True,
         },
         "log_device_placement": False,
@@ -146,6 +148,14 @@ COMMON_CONFIG = {
         # since that can cause crashes with many concurrent drivers.
         "intra_op_parallelism_threads": 8,
         "inter_op_parallelism_threads": 8,
+        "gpu_options": {
+            # Can set to string list (e.g "0,3") to enable only subset of
+            # visible GPUs. See TF docs for semantics.
+            "visible_device_list": None,
+            # Set to True to allow GPU memory usage to start small grow over
+            # time, or False to allocate needed memory up-front. See TF docs.
+            "allow_growth": None,
+        }
     },
     # Whether to LZ4 compress individual observations
     "compress_observations": False,

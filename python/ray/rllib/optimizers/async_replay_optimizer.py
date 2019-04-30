@@ -254,8 +254,8 @@ class ReplayActor(object):
         self.prioritized_replay_eps = prioritized_replay_eps
 
         def new_buffer():
-            return PrioritizedReplayBuffer(
-                self.buffer_size, alpha=prioritized_replay_alpha)
+            return PrioritizedReplayBuffer(self.buffer_size,
+                                           alpha=prioritized_replay_alpha)
 
         self.replay_buffers = collections.defaultdict(new_buffer)
 
@@ -280,7 +280,7 @@ class ReplayActor(object):
                         row["new_obs"], row["dones"], row["weights"])
         self.num_added += batch.count
 
-    def replay(self, force=False, batch_size=None):
+    def replay(self, force=False, batch_size=None, uniform=False):
         if self.num_added < self.replay_starts and not force:
             return None
 
@@ -290,25 +290,36 @@ class ReplayActor(object):
         with self.replay_timer:
             samples = {}
             for policy_id, replay_buffer in self.replay_buffers.items():
-                (obses_t, actions, rewards, obses_tp1, dones, weights,
-                 batch_indexes) = replay_buffer.sample(
-                     batch_size, beta=self.prioritized_replay_beta)
-                samples[policy_id] = SampleBatch({
-                    "obs": obses_t,
-                    "actions": actions,
-                    "rewards": rewards,
-                    "new_obs": obses_tp1,
-                    "dones": dones,
-                    "weights": weights,
-                    "batch_indexes": batch_indexes
-                })
+                if uniform:
+                    (obses_t, actions, rewards, obses_tp1,
+                     dones) = replay_buffer.sample_uniform(batch_size)
+                    samples[policy_id] = SampleBatch({
+                        "obs": obses_t,
+                        "actions": actions,
+                        "rewards": rewards,
+                        "new_obs": obses_tp1,
+                        "dones": dones,
+                    })
+                else:
+                    (obses_t, actions, rewards, obses_tp1, dones, weights,
+                     batch_indexes) = replay_buffer.sample(
+                         batch_size, beta=self.prioritized_replay_beta)
+                    samples[policy_id] = SampleBatch({
+                        "obs": obses_t,
+                        "actions": actions,
+                        "rewards": rewards,
+                        "new_obs": obses_tp1,
+                        "dones": dones,
+                        "weights": weights,
+                        "batch_indexes": batch_indexes
+                    })
             return MultiAgentBatch(samples, batch_size)
 
     def update_priorities(self, prio_dict):
         with self.update_priorities_timer:
             for policy_id, (batch_indexes, td_errors) in prio_dict.items():
-                new_priorities = (
-                    np.abs(td_errors) + self.prioritized_replay_eps)
+                new_priorities = (np.abs(td_errors) +
+                                  self.prioritized_replay_eps)
                 self.replay_buffers[policy_id].update_priorities(
                     batch_indexes, new_priorities)
 

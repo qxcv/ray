@@ -37,7 +37,8 @@ APEX_TD3_DEFAULT_CONFIG = merge_dicts(
         "train_batch_size": 256,
         "sample_batch_size": 20,
         "per_worker_exploration": False,
-        "worker_side_prioritization": True,
+        # this is not even supported by DDPG
+        "worker_side_prioritization": False,
         "min_iter_time_s": 30,
     },
 )

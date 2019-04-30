@@ -187,7 +187,10 @@ class LocalReplaySampler(object):
         if self.replay_tasks is None:
             self._make_replay_tasks()
         self.replay_tasks.add(
-            ra, ra.replay.remote(force=True, batch_size=self.batch_size))
+            ra,
+            ra.replay.remote(force=True,
+                             batch_size=self.batch_size,
+                             uniform=True))
 
     def _make_replay_tasks(self):
         if self.replay_tasks is None:
@@ -303,15 +306,33 @@ def load_latest_demos(demo_dir):
 @ex.config
 def cfg():
     env_name = 'InvertedPendulum-v2'  # noqa: F841
+    max_time_s = 3600  # noqa: F841
+    # TensorFlow configurations
+    tf_configs = {  # noqa: F841
+        "discrim": {
+            "gpu_num": None,
+            "tf_threads": None,
+        },
+        "td3_local_learner": {
+            "gpu_num": None,
+            "tf_threads": None,
+        },
+        "td3_defaults": {
+            # these should generally not use GPU, and should only need one
+            # thread each (they don't do much computation)
+            "gpu_num": None,
+            "tf_threads": 1,
+        }
+    }
     discrim_config = {  # noqa: F841
         "lr": 1e-3,
-        "batch_size": 128,
+        "batch_size": 512,
         "updates_per_epoch": 50,
         # update shared weights at least once every time we take this many
         # steps
-        "sync_at_least_every": 50,
+        "sync_at_least_every": 25,
         "model": {
-            "fcnet_hiddens": [128, 128],
+            "fcnet_hiddens": [256, 128],
             "fcnet_activation": "relu"
         }
     }
@@ -326,10 +347,9 @@ def cfg():
     td3_conf = {  # noqa: F841
         "evaluation_interval": 10,
         "evaluation_num_episodes": 5,
-    }
-    tf_par_conf = {  # noqa: F841
-        "inter_par_threads": 1,
-        "intra_par_threads": 1,
+        "timesteps_per_iteration": 5000,
+        "min_iter_time_s": 30,
+        "train_batch_size": 256,
     }
 
 
@@ -346,9 +366,23 @@ def fix_cfg_relpaths(config, command_name, logger):
     }
 
 
+def make_tf_config_args(tf_threads=None, gpu_num=None):
+    """Make the appropriate kwargs """
+    cproto_args = {}
+    if tf_threads is not None:
+        cproto_args["inter_op_parallelism_threads"] = tf_threads
+        cproto_args["intra_op_parallelism_threads"] = tf_threads
+    if gpu_num is None:
+        cproto_args['gpu_options'] = dict(visible_device_list="")
+    else:
+        cproto_args['gpu_options'] = dict(visible_devices=str(gpu_num),
+                                          allow_growth=True)
+    return cproto_args
+
+
 @ex.main
-def main(env_name, discrim_config, expert_config, full_data_dir, tf_par_conf,
-         td3_conf, _config, _run):
+def main(env_name, discrim_config, expert_config, full_data_dir, tf_configs,
+         td3_conf, max_time_s, _config, _run):
     """Run GAIL on a given environment. Assumes that you've already used
     train_expert to collect expert demos for the environment."""
     out_dir = os.path.join(full_data_dir, "gail_run_%s" % _run._id)
@@ -356,34 +390,31 @@ def main(env_name, discrim_config, expert_config, full_data_dir, tf_par_conf,
     stat_logger = CSVLogger(config=_config, logdir=out_dir)
     ray.init()
     # algo config dict
-    tf_par_args = {
-        "inter_op_parallelism_threads": tf_par_conf["inter_par_threads"],
-        "intra_op_parallelism_threads": tf_par_conf["intra_par_threads"]
-    }
     td3_base_conf = {
         "reward_model": discrim_config["model"],
-        "tf_session_args": tf_par_args,
-        "local_evaluator_tf_session_args": tf_par_args,
+        # this is used by the local evaluator, which (in the async replay
+        # buffer code) is responsible for making actual optimiser steps
+        "local_evaluator_tf_session_args": make_tf_config_args(
+            **tf_configs["td3_local_learner"]),
+        # this is used by all the rollout evaluators & anything else that gets
+        # instantiated
+        "tf_session_args": make_tf_config_args(**tf_configs["td3_defaults"]),
+        # we manage GPUs ourselves
         "num_gpus": 0,
-        "timesteps_per_iteration": 5000,
-        "min_iter_time_s": 1,
     }
     td3_conf = merge_dicts(td3_base_conf, td3_conf)
     disc_param_server = DiscriminatorParameterServer.remote()
     named_actors.register_actor("global_reward_params", disc_param_server)
     trainer_actor = TrainerActor.remote(env_name, td3_conf)
     replay_actors_handle = trainer_actor.get_replay_actors.remote()
-    discrim_actor = DiscriminatorActor.remote(env_name, discrim_config,
-                                              expert_config, td3_conf,
-                                              tf_par_args, disc_param_server,
-                                              replay_actors_handle)
+    discrim_actor = DiscriminatorActor.remote(
+        env_name, discrim_config, expert_config, td3_conf,
+        make_tf_config_args(**tf_configs["discrim"]), disc_param_server,
+        replay_actors_handle)
 
     itr = 0
-    while True:
-        # TODO: rewrite lots of things to use get_and_free; it seems like I
-        # have some memory leaks in my concurrent code (although that *may* be
-        # just due to big replay size)
-
+    start_time = time.time()
+    while time.time() - start_time < max_time_s:
         # train for a little while
         trainer_handle = trainer_actor.train_epoch.remote()
         discrim_handle = discrim_actor.train_epoch.remote()
@@ -404,6 +435,8 @@ def main(env_name, discrim_config, expert_config, full_data_dir, tf_par_conf,
 
         # next epoch!
         itr += 1
+
+    ray.shutdown()
 
 
 @ex.command

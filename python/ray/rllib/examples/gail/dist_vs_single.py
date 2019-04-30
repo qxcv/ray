@@ -19,14 +19,12 @@ from ray.rllib.models import ModelCatalog
 from ray.rllib.offline.json_reader import JsonReader
 from ray.rllib.utils.memory import ray_get_and_free
 
-# 8 will probably favour the local approach
-# other values to try: 1, 16, 32
 ENV_NAME = 'HalfCheetah-v2'
 DEMO_DIR = "./data/HalfCheetah-v2/demos/"
 
 
 class ExperimentDiscriminator(object):
-    # slightly stripped-down version of discriminator class from gail.py
+    # slight variation on the Discriminator class from gail.py
     def __init__(self, obs_space, act_space, disc_config):
         obs_dim, = obs_space.shape
         act_dim, = act_space.shape
@@ -74,12 +72,6 @@ class ExperimentDiscriminator(object):
             tf.assign(w, w_ph)
             for w, w_ph in zip(self.discrim_train_vars, self.weight_phs)
         ])
-
-    def apply_gradients(self, grads, sess):
-        # convenience fn to apply gradients, copied from Ray parameter server
-        # example
-        feed_dict = dict(zip(self.grads_ph, grads))
-        sess.run(self.apply_grads_placeholder, feed_dict=feed_dict)
 
     def _make_discrim_logits(self, in_state, in_action):
         in_data = tf.concat([in_state, in_action], axis=1)
