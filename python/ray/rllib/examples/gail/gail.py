@@ -37,7 +37,7 @@ import tensorflow as tf  # noqa: E402
 ex = Experiment('gail')
 
 
-@ray.remote(num_cpus=1, num_gpus=1)
+# @ray.remote(num_cpus=1, num_gpus=1)
 class DiscriminatorActor(object):
     def __init__(self, env_name, disc_config, expert_config, td3_conf,
                  tf_par_args, param_server, replay_actors):
@@ -156,7 +156,7 @@ class DiscriminatorParameterServer(object):
         return self.weights
 
 
-@ray.remote(num_cpus=1, num_gpus=1)
+# @ray.remote(num_cpus=1)
 class TrainerActor(object):
     def __init__(self, env_name, td3_conf):
         self.trainer = ApexTD3Trainer(env=env_name, config=td3_conf)
@@ -325,7 +325,7 @@ def cfg():
         }
     }
     discrim_config = {  # noqa: F841
-        "lr": 1e-3,
+        "lr": 1e-5,
         "batch_size": 512,
         "updates_per_epoch": 50,
         # update shared weights at least once every time we take this many
@@ -351,6 +351,8 @@ def cfg():
         "min_iter_time_s": 30,
         "train_batch_size": 256,
         "num_workers": 32,
+        "pure_exploration_steps": int(1e6),
+        "learning_starts": int(1e5),
     }
 
 
@@ -408,12 +410,19 @@ def main(env_name, discrim_config, expert_config, full_data_dir, tf_configs,
     td3_conf = merge_dicts(td3_base_conf, td3_conf)
     disc_param_server = DiscriminatorParameterServer.remote()
     named_actors.register_actor("global_reward_params", disc_param_server)
-    trainer_actor = TrainerActor.remote(env_name, td3_conf)
+    TA = ray.remote(
+        num_cpus=1,
+        num_gpus=1 if tf_configs["td3_local_learner"]["gpu_num"] is not None
+        else 0)(TrainerActor)
+    trainer_actor = TA.remote(env_name, td3_conf)
     replay_actors_handle = trainer_actor.get_replay_actors.remote()
-    discrim_actor = DiscriminatorActor.remote(
-        env_name, discrim_config, expert_config, td3_conf,
-        make_tf_config_args(**tf_configs["discrim"]), disc_param_server,
-        replay_actors_handle)
+    DA = ray.remote(num_cpus=1,
+                    num_gpus=1 if tf_configs["discrim"]["gpu_num"] is not None
+                    else 0)(DiscriminatorActor)
+    discrim_actor = DA.remote(env_name, discrim_config, expert_config,
+                              td3_conf,
+                              make_tf_config_args(**tf_configs["discrim"]),
+                              disc_param_server, replay_actors_handle)
 
     itr = 0
     start_time = time.time()
