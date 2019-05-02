@@ -12,6 +12,7 @@ from ray.rllib.agents.trainer import Trainer, with_common_config
 from ray.rllib.agents.dqn.dqn_policy_graph import DQNPolicyGraph
 from ray.rllib.evaluation.metrics import collect_metrics
 from ray.rllib.evaluation.sample_batch import DEFAULT_POLICY_ID
+from ray.rllib.optimizers.async_replay_optimizer import ApexLearnerEvaluator
 from ray.rllib.utils.annotations import override
 from ray.rllib.utils.memory import ray_get_and_free
 from ray.rllib.utils.schedules import ConstantSchedule, LinearSchedule
@@ -234,6 +235,10 @@ class DQNTrainer(Trainer):
         else:
             # Hack to workaround https://github.com/ray-project/ray/issues/2541
             self.remote_evaluators = None
+            # single remote evaluator used only for remote optimisation with
+            # APE-X (HACK no other trainer or optimiser else supports this & it
+            # breaks current abstractions)
+            self.remote_opt_evaluator = None
 
         self.optimizer = getattr(optimizers, config["optimizer_class"])(
             self.local_evaluator, self.remote_evaluators,
@@ -241,7 +246,17 @@ class DQNTrainer(Trainer):
         # Create the remote evaluators *after* the replay actors
         if self.remote_evaluators is None:
             self.remote_evaluators = create_remote_evaluators()
-            self.optimizer._set_evaluators(self.remote_evaluators)
+            self.remote_opt_evaluator = self.make_remote_opt_evaluator(
+                env_creator,
+                self._policy_graph,
+                config["num_workers"] + 1,
+                cls=ApexLearnerEvaluator,
+                extra_config={
+                    "batch_mode": "complete_episodes",
+                    "batch_steps": 1
+                })
+            self.optimizer._set_evaluators(
+                self.remote_evaluators, self.remote_opt_evaluator)
 
         self.last_target_update_ts = 0
         self.num_target_updates = 0

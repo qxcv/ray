@@ -25,12 +25,24 @@ class TaskPool(object):
         self._tasks[obj_id] = worker
         self._objects[obj_id] = all_obj_ids
 
-    def completed(self, blocking_wait=False):
+    def completed(self, blocking_wait=False, num_returns=None,
+                  block_timeout=10.0):
+        """Return completed tasks, optionally blocking until some task
+        finishes. If num_returns is not None, then this will *always* return
+        precisely num_returns results (capped at the number of tasks)."""
         pending = list(self._tasks)
+        if num_returns is None:
+            num_returns = len(pending)
+            min_returns = 1
+        else:
+            assert 1 <= num_returns <= len(pending)
+            min_returns = num_returns
         if pending:
-            ready, _ = ray.wait(pending, num_returns=len(pending), timeout=0)
+            ready, _ = ray.wait(pending, num_returns=num_returns, timeout=0)
             if not ready and blocking_wait:
-                ready, _ = ray.wait(pending, num_returns=1, timeout=10.0)
+                ready, _ = ray.wait(pending,
+                                    num_returns=min_returns,
+                                    timeout=block_timeout)
             for obj_id in ready:
                 yield (self._tasks.pop(obj_id), self._objects.pop(obj_id))
 

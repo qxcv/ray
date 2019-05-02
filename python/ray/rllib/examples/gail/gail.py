@@ -22,7 +22,7 @@ from ray.rllib.evaluation.sample_batch import SampleBatch  # noqa: E402
 from ray.rllib.offline.json_writer import JsonWriter  # noqa: E402
 from ray.rllib.offline.json_reader import JsonReader  # noqa: E402
 from ray.rllib.optimizers.async_replay_optimizer \
-    import REPLAY_QUEUE_DEPTH  # noqa: E402
+    import REPLAY_QUEUE_DEPTH, ReplayActorSampler  # noqa: E402
 from ray.rllib.models import ModelCatalog  # noqa: E402
 from ray.rllib.utils.memory import ray_get_and_free  # noqa: E402
 from ray.rllib.utils.actors import TaskPool  # noqa: E402
@@ -66,7 +66,7 @@ class DiscriminatorActor(object):
         self.reward_vars = ray.experimental.tf_utils.TensorFlowVariables(
             self.discriminator.reward, self.sess)
 
-        self.replay_sampler = LocalReplaySampler(
+        self.replay_sampler = ReplayActorSampler(
             replay_actors,
             # use 1/2 of real batch size b/c when training discrim we mix with
             # and other 1/2 expert samples
@@ -106,7 +106,7 @@ class DiscriminatorActor(object):
         self._wait_handle = self.param_server.set_weights.remote(weights)
 
     def _train_step(self):
-        ma_batch = self.replay_sampler.get_batch()
+        ma_batch, _ = self.replay_sampler.get_batch()
         if not ma_batch.policy_batches:
             # sometimes this happens at the beginning of training b/c
             # there are not enough samples in the replay buffer
@@ -166,60 +166,6 @@ class TrainerActor(object):
 
     def train_epoch(self):
         return self.trainer.train()
-
-
-class LocalReplaySampler(object):
-    """Simple class to keep pulling experience batches out of some replay
-    actors. NOT THREAD-SAFE OR MULTIPROCESSING-SAFE! You're meant to have one
-    of these per discriminator training process/thread."""
-
-    def __init__(self, replay_actors, batch_size):
-        self.replay_actors = replay_actors
-        self.batch_size = batch_size
-        # we lazily create replay_tasks so that they get spawned *after*
-        # training starts; otherwise the first few sampled batches are empty
-        # b/c there's nothing the replay buffer :(
-        self.replay_tasks = None
-        # queued batches
-        self.batch_queue = collections.deque()
-
-    def _add_replay_task(self, ra):
-        if self.replay_tasks is None:
-            self._make_replay_tasks()
-        self.replay_tasks.add(
-            ra,
-            ra.replay.remote(force=True,
-                             batch_size=self.batch_size,
-                             uniform=True))
-
-    def _make_replay_tasks(self):
-        if self.replay_tasks is None:
-            self.replay_tasks = TaskPool()
-            for ra in self.replay_actors:
-                for _ in range(REPLAY_QUEUE_DEPTH):
-                    self._add_replay_task(ra)
-
-    def _refresh(self, blocking=False):
-        # FIXME: this code is partially copied from AsyncReplayOptimizer; I
-        # should unify the two to de-duplicate (maybe use this class in both
-        # cases)
-        if self.replay_tasks is None:
-            self._make_replay_tasks()
-        for ra, replay in self.replay_tasks.completed(blocking_wait=blocking):
-            self._add_replay_task(ra)
-            samples = ray_get_and_free(replay)
-            # Defensive copy against plasma crashes, see #2610 #3452
-            self.batch_queue.append((ra, samples and samples.copy()))
-
-    def get_batch(self):
-        if len(self.batch_queue) == 0:
-            self._refresh(blocking=True)
-            result = self.batch_queue.popleft()
-        else:
-            result = self.batch_queue.popleft()
-            self._refresh(blocking=False)
-        _, batch = result
-        return batch
 
 
 class Discriminator(object):
@@ -313,7 +259,7 @@ def cfg():
             "gpu_num": None,
             "tf_threads": None,
         },
-        "td3_local_learner": {
+        "td3_remote_learner": {
             "gpu_num": None,
             "tf_threads": None,
         },
@@ -394,13 +340,16 @@ def main(env_name, discrim_config, expert_config, full_data_dir, tf_configs,
     os.makedirs(out_dir, exist_ok=True)
     stat_logger = CSVLogger(config=_config, logdir=out_dir)
     ray.init(num_cpus=38, num_gpus=2)
+    ropt_num_gpus = int(
+        tf_configs["td3_remote_learner"]["gpu_num"] is not None)
     # algo config dict
     td3_base_conf = {
         "reward_model": discrim_config["model"],
         # this is used by the local evaluator, which (in the async replay
         # buffer code) is responsible for making actual optimiser steps
-        "local_evaluator_tf_session_args": make_tf_config_args(
-            **tf_configs["td3_local_learner"]),
+        "remote_opt_evaluator_tf_session_args": make_tf_config_args(
+            **tf_configs["td3_remote_learner"]),
+        "num_gpus_remote_opt": ropt_num_gpus,
         # this is used by all the rollout evaluators & anything else that gets
         # instantiated
         "tf_session_args": make_tf_config_args(**tf_configs["td3_defaults"]),
@@ -410,10 +359,7 @@ def main(env_name, discrim_config, expert_config, full_data_dir, tf_configs,
     td3_conf = merge_dicts(td3_base_conf, td3_conf)
     disc_param_server = DiscriminatorParameterServer.remote()
     named_actors.register_actor("global_reward_params", disc_param_server)
-    TA = ray.remote(
-        num_cpus=1,
-        num_gpus=1 if tf_configs["td3_local_learner"]["gpu_num"] is not None
-        else 0)(TrainerActor)
+    TA = ray.remote(num_cpus=1, num_gpus=0)(TrainerActor)
     trainer_actor = TA.remote(env_name, td3_conf)
     replay_actors_handle = trainer_actor.get_replay_actors.remote()
     DA = ray.remote(num_cpus=1,

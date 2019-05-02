@@ -17,6 +17,7 @@ from six.moves import queue
 
 import ray
 from ray.rllib.evaluation.metrics import get_learner_stats
+from ray.rllib.evaluation.policy_evaluator import PolicyEvaluator
 from ray.rllib.evaluation.sample_batch import SampleBatch, DEFAULT_POLICY_ID, \
     MultiAgentBatch
 from ray.rllib.optimizers.policy_optimizer import PolicyOptimizer
@@ -70,9 +71,7 @@ class AsyncReplayOptimizer(PolicyOptimizer):
         self.prioritized_replay_beta = prioritized_replay_beta
         self.prioritized_replay_eps = prioritized_replay_eps
         self.max_weight_sync_delay = max_weight_sync_delay
-
-        self.learner = LearnerThread(self.local_evaluator)
-        self.learner.start()
+        self.train_batch_size = train_batch_size
 
         if self.batch_replay:
             replay_cls = BatchReplayActor
@@ -89,6 +88,15 @@ class AsyncReplayOptimizer(PolicyOptimizer):
             prioritized_replay_beta,
             prioritized_replay_eps,
         ], num_replay_buffer_shards)
+
+        # TODO: replace this with an actual actor so that it can run
+        # concurrently
+        # self.learner = LearnerThread(self.local_evaluator)
+        # self.learner.start()
+        self.param_server = ApexParameterServer.remote()
+
+        self.last_num_steps_trained_time = time.time()
+        self.last_num_steps_trained = self.num_steps_trained
 
         # Stats
         self.timers = {
@@ -113,31 +121,39 @@ class AsyncReplayOptimizer(PolicyOptimizer):
 
         # Kick off async background sampling
         self.sample_tasks = TaskPool()
-        if self.remote_evaluators:
-            self._set_evaluators(self.remote_evaluators)
+        print("NOT calling set_evalutors")
+        self.remote_evaluators = None
+        # assert self.remote_evaluators is None, \
+        #     "this should be set later on; my hacks only work with DQNTrainer"
+        self.remote_opt_evaluator = None
+        self.learner_stats =None
 
     @override(PolicyOptimizer)
     def step(self):
-        assert self.learner.is_alive()
         assert len(self.remote_evaluators) > 0
         start = time.time()
-        sample_timesteps, train_timesteps = self._step()
+        sample_timesteps, new_train_timesteps, stats = self._step()
         time_delta = time.time() - start
         self.timers["sample"].push(time_delta)
         self.timers["sample"].push_units_processed(sample_timesteps)
-        if train_timesteps > 0:
+        if new_train_timesteps > 0:
             self.learning_started = True
-        if self.learning_started:
-            self.timers["train"].push(time_delta)
-            self.timers["train"].push_units_processed(train_timesteps)
+        if self.learning_started \
+           and new_train_timesteps > self.num_steps_trained:
+            train_td = time.time() - self.last_num_steps_trained_time
+            self.timers["train"].push(train_td)
+            train_step_d = new_train_timesteps - self.num_steps_trained
+            self.timers["train"].push_units_processed(train_step_d)
+            self.last_num_steps_trained_time = time.time()
+            self.learner_stats = stats
         self.num_steps_sampled += sample_timesteps
-        self.num_steps_trained += train_timesteps
+        self.num_steps_trained = new_train_timesteps
 
     @override(PolicyOptimizer)
     def stop(self):
         for r in self.replay_actors:
             r.__ray_terminate__.remote()
-        self.learner.stopped = True
+        # self.learner.stopped = True
 
     @override(PolicyOptimizer)
     def reset(self, remote_evaluators):
@@ -152,18 +168,30 @@ class AsyncReplayOptimizer(PolicyOptimizer):
             "{}_time_ms".format(k): round(1000 * self.timers[k].mean, 3)
             for k in self.timers
         }
-        timing["learner_grad_time_ms"] = round(
-            1000 * self.learner.grad_timer.mean, 3)
-        timing["learner_dequeue_time_ms"] = round(
-            1000 * self.learner.queue_timer.mean, 3)
+        # timing["learner_grad_time_ms"] = round(
+        #     1000 * self.learner.grad_timer.mean, 3)
+        # timing["learner_dequeue_time_ms"] = round(
+        #     1000 * self.learner.queue_timer.mean, 3)
         stats = {
+            # XXX: sample_throughput is complete garbage, and train_throughput
+            # WAS complete garbage before I changed it. Before, step() was just
+            # timing how long it took to *talk to the actors for one
+            # iteration*, and using that as the denominator in the throughput
+            # computation. Trust the num_steps_trained numbers over the
+            # _throughput numbers!
             "sample_throughput": round(self.timers["sample"].mean_throughput,
                                        3),
             "train_throughput": round(self.timers["train"].mean_throughput, 3),
             "num_weight_syncs": self.num_weight_syncs,
             "num_samples_dropped": self.num_samples_dropped,
-            "learner_queue": self.learner.learner_queue_size.stats(),
+            # "learner_queue": self.learner.learner_queue_size.stats(),
             "replay_shard_0": replay_stats,
+            "async_time_sample_processing": round(
+                self.timers["sample_processing"].mean, 3),
+            "async_time_replay_processing": round(
+                self.timers["replay_processing"].mean, 3),
+            "async_time_update_priorities": round(
+                self.timers["update_priorities"].mean, 3),
         }
         debug_stats = {
             "timing_breakdown": timing,
@@ -172,12 +200,13 @@ class AsyncReplayOptimizer(PolicyOptimizer):
         }
         if self.debug:
             stats.update(debug_stats)
-        if self.learner.stats:
-            stats["learner"] = self.learner.stats
+        if self.learner_stats:
+            stats["learner"] = self.learner_stats
         return dict(PolicyOptimizer.stats(self), **stats)
 
     # For https://github.com/ray-project/ray/issues/2541 only
-    def _set_evaluators(self, remote_evaluators):
+    def _set_evaluators(self, remote_evaluators, remote_opt_evaluator):
+        print("calling set_evaluators()")
         self.remote_evaluators = remote_evaluators
         weights = self.local_evaluator.get_weights()
         for ev in self.remote_evaluators:
@@ -185,9 +214,14 @@ class AsyncReplayOptimizer(PolicyOptimizer):
             self.steps_since_update[ev] = 0
             for _ in range(SAMPLE_QUEUE_DEPTH):
                 self.sample_tasks.add(ev, ev.sample_with_count.remote())
+        self.remote_opt_evaluator = remote_opt_evaluator
+        self.remote_opt_evaluator.do_apex_setup.remote(
+            weights, self.replay_actors, self.train_batch_size,
+            self.param_server)
+        self.remote_opt_evaluator.train_forever.remote()
 
     def _step(self):
-        sample_timesteps, train_timesteps = 0, 0
+        sample_timesteps = 0
         weights = None
 
         with self.timers["sample_processing"]:
@@ -196,12 +230,15 @@ class AsyncReplayOptimizer(PolicyOptimizer):
             for i, (ev, (sample_batch, count)) in enumerate(completed):
                 sample_timesteps += counts[i]
 
+                # HACK THIS IS WRONG! The replay actors should send their data
+                # *straight to a random shard*. It doesn't make sense to
+                # introduce a bottleneck here. Fix this later.
                 # Send the data to the replay buffer
                 random.choice(
                     self.replay_actors).add_batch.remote(sample_batch)
 
                 # Update weights if needed
-                self.steps_since_update[ev] += counts[i]
+                self.steps_since_update[ev] = counts[i]
                 if self.steps_since_update[ev] >= self.max_weight_sync_delay:
                     # Note that it's important to pull new weights once
                     # updated to avoid excessive correlation between actors
@@ -217,24 +254,17 @@ class AsyncReplayOptimizer(PolicyOptimizer):
                 # Kick off another sample request
                 self.sample_tasks.add(ev, ev.sample_with_count.remote())
 
-        with self.timers["replay_processing"]:
-            for ra, replay in self.replay_tasks.completed():
-                self.replay_tasks.add(ra, ra.replay.remote())
-                if self.learner.inqueue.full():
-                    self.num_samples_dropped += 1
-                else:
-                    with self.timers["get_samples"]:
-                        samples = ray_get_and_free(replay)
-                    # Defensive copy against plasma crashes, see #2610 #3452
-                    self.learner.inqueue.put((ra, samples and samples.copy()))
+        # we *always* pull weights from param server on every iteration; that
+        # helps ensure that we don't get too out of date (also the amount of
+        # compute done by this actor doesn't matter that much, since the actual
+        # learner is independent)
+        new_weights_h = self.param_server.get_weights.remote()
+        new_weights, new_train_timesteps, stats \
+            = ray_get_and_free(new_weights_h)
+        if new_weights is not None:
+            self.local_evaluator.set_weights(new_weights)
 
-        with self.timers["update_priorities"]:
-            while not self.learner.outqueue.empty():
-                ra, prio_dict, count = self.learner.outqueue.get()
-                ra.update_priorities.remote(prio_dict)
-                train_timesteps += count
-
-        return sample_timesteps, train_timesteps
+        return sample_timesteps, new_train_timesteps, stats
 
 
 @ray.remote(num_cpus=0)
@@ -387,44 +417,125 @@ class BatchReplayActor(object):
         return stat
 
 
-class LearnerThread(threading.Thread):
-    """Background thread that updates the local model from replay data.
+class ReplayActorSampler(object):
+    """Simple class to keep pulling experience batches out of some replay
+    actors. This is not meant to be an actor, and is NOT THREAD-SAFE OR
+    MULTIPROCESSING-SAFE! You're meant to have one of these per training
+    process/thread."""
 
-    The learner thread communicates with the main thread through Queues. This
-    is needed since Ray operations can only be run on the main thread. In
-    addition, moving heavyweight gradient ops session runs off the main thread
-    improves overall throughput.
-    """
+    def __init__(self, replay_actors, batch_size=None, uniform=True,
+                 force=True):
+        self.replay_actors = replay_actors
+        self.batch_size = batch_size
+        # we lazily create replay_tasks so that they get spawned *after*
+        # training starts; otherwise the first few sampled batches are empty
+        # b/c there's nothing the replay buffer :(
+        self.replay_tasks = None
+        self.uniform = uniform
+        self.force = force
 
-    def __init__(self, local_evaluator):
-        threading.Thread.__init__(self)
-        self.learner_queue_size = WindowStat("size", 50)
-        self.local_evaluator = local_evaluator
-        self.inqueue = queue.Queue(maxsize=LEARNER_QUEUE_MAX_SIZE)
-        self.outqueue = queue.Queue()
-        self.queue_timer = TimerStat()
-        self.grad_timer = TimerStat()
-        self.daemon = True
-        self.weights_updated = False
-        self.stopped = False
-        self.stats = {}
+    def _add_replay_task(self, ra):
+        if self.replay_tasks is None:
+            self._make_replay_tasks()
+        self.replay_tasks.add(
+            ra,
+            ra.replay.remote(force=self.force,
+                             batch_size=self.batch_size,
+                             uniform=self.uniform))
 
-    def run(self):
-        while not self.stopped:
-            self.step()
+    def _make_replay_tasks(self):
+        if self.replay_tasks is not None:
+            return
+        self.replay_tasks = TaskPool()
+        for ra in self.replay_actors:
+            for _ in range(REPLAY_QUEUE_DEPTH):
+                self._add_replay_task(ra)
 
-    def step(self):
-        with self.queue_timer:
-            ra, replay = self.inqueue.get()
-        if replay is not None:
-            prio_dict = {}
-            with self.grad_timer:
-                grad_out = self.local_evaluator.learn_on_batch(replay)
+    def get_batch(self):
+        if self.replay_tasks is None:
+            self._make_replay_tasks()
+        ra_replay = list(self.replay_tasks.completed(
+            blocking_wait=True, num_returns=1, block_timeout=900.0))
+        assert len(ra_replay) >= 1, \
+            "didn't get result in 900s; probably timed out"
+        ra_replay, = ra_replay
+        ra, replay = ra_replay
+        self._add_replay_task(ra)
+        # TODO: figure out whether this is the best way to maximise throughput;
+        # should I be running this in a BG thread or something?
+        replay = ray_get_and_free(replay)
+        return replay, ra
+
+
+@ray.remote(num_cpus=0)
+class ApexParameterServer(object):
+    """Used for storing parameters set by ApexLearnerEvaluator."""
+    def __init__(self):
+        self.weights = None
+        self.stats = None
+        self.last_ts = 0
+
+    def set_weights(self, weights, ts, stats):
+        self.last_ts = ts
+        self.weights = weights
+        self.stats = stats
+
+    def get_weights(self, last_ts=None):
+        if last_ts is None or last_ts < self.latest_ts:
+            return self.weights, self.last_ts, self.stats
+        # return nothing if no new weights have been pushed
+        return None, self.last_ts, self.stats
+
+
+class ApexLearnerEvaluator(PolicyEvaluator):
+    """Having a thread is stupid, perf dies due to GIL contention. Run this in
+    an actor instead using LearnerEvaluator.as_remote(). This is a subclass of
+    PolicyEvaluator so that policy evaluation & learning can take place in the
+    same worker (rather than needing separate workers & tasks to coordinate
+    with the PolicyEvaluator)."""
+
+    def _init(self):
+        self.__sample_timer = TimerStat()
+        self.__replay_timer = TimerStat()
+        self.__grad_timer = TimerStat()
+        self.__stats = {}
+        self.__train_timesteps = 0
+        self.__last_push_h = None
+
+    def do_apex_setup(self, weights, replay_workers, batch_size, param_server):
+        self.set_weights(weights)
+        self.__replay_workers = replay_workers
+        self.__batch_size = batch_size
+        self.__sample_batcher = ReplayActorSampler(
+            replay_workers, force=False, uniform=False)
+        self.__param_server = param_server
+        self.__last_push = 0
+        self._push_weights()
+
+    def _push_weights(self):
+        if self.__last_push_h is not None:
+            # wait for last push to complete
+            ray.wait([self.__last_push_h])
+        self.__last_push_h = self.__param_server.set_weights.remote(
+            self.get_weights(), self.__train_timesteps, self.__stats)
+        self.__last_push = self.__train_timesteps
+
+    def train_forever(self):
+        """Train until the actor gets shut down."""
+        while True:
+            samples, ra = self.__sample_batcher.get_batch()
+            if samples is not None:
+                prio_dict = {}
+                # with self.grad_timer:
+                grad_out = self.learn_on_batch(samples)
                 for pid, info in grad_out.items():
                     prio_dict[pid] = (
-                        replay.policy_batches[pid].data.get("batch_indexes"),
+                        samples.policy_batches[pid].data.get(
+                            "batch_indexes"),
                         info.get("td_error"))
-                    self.stats[pid] = get_learner_stats(info)
-            self.outqueue.put((ra, prio_dict, replay.count))
-        self.learner_queue_size.push(self.inqueue.qsize())
-        self.weights_updated = True
+                    self.__stats[pid] = get_learner_stats(info)
+                ra.update_priorities.remote(prio_dict)
+                self.__train_timesteps += samples.total()
+                # TODO: make this push interval configurable
+                if self.__train_timesteps - self.__last_push >= 400:
+                    self._push_weights()

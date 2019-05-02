@@ -676,7 +676,7 @@ class DDPGPolicyGraph(DDPGPostprocessing, TFPolicyGraph):
         # TODO: consider doing a moving average update or some shit
         if new_weights is None:
             warnings.warn(
-                "Tried to .set_reward_weights() with weights equal to None;"
+                "Tried to .set_reward_weights() with weights equal to None; "
                 "ignoring, since param server probably not spooled up")
             return
         self.reward_variables.set_weights(new_weights)

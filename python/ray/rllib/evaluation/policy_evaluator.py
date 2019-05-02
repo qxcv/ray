@@ -418,8 +418,14 @@ class PolicyEvaluator(EvaluatorInterface):
         self.output_writer = output_creator(self.io_context)
         assert isinstance(self.output_writer, OutputWriter), self.output_writer
 
+        # HACK for my ApexLearnerEvaluator
+        self._init()
+
         logger.debug("Created evaluator with env {} ({}), policies {}".format(
             self.async_env, self.env, self.policy_map))
+
+    def _init(self):
+        pass
 
     @override(EvaluatorInterface)
     def sample(self):

@@ -104,6 +104,13 @@ COMMON_CONFIG = {
     "num_gpus_per_worker": 0,
     # Any custom resources to allocate per worker.
     "custom_resources_per_worker": {},
+    # Number of CPUs to allocate for remote opt actor (only used with APE-X &
+    # DQN at the moment).
+    "num_cpus_remote_opt": 1,
+    # Number of GPUs to allocate for remote opt actor. This can be fractional.
+    "num_gpus_remote_opt": 0,
+    # Any custom resources to allocate for remote opt actor.
+    "custom_resources_remote_opt": {},
     # Number of CPUs to allocate for the driver. Note: this only takes effect
     # when running in Tune.
     "num_cpus_for_driver": 1,
@@ -155,7 +162,18 @@ COMMON_CONFIG = {
             "visible_device_list": None,
             # Set to True to allow GPU memory usage to start small grow over
             # time, or False to allocate needed memory up-front. See TF docs.
-            "allow_growth": None,
+            "allow_growth": True,
+        }
+    },
+    # Override the following tf session args on the remote optimiser
+    "remote_opt_evaluator_tf_session_args": {
+        # defaults are same as local evaluator
+        "intra_op_parallelism_threads": 8,
+        "inter_op_parallelism_threads": 8,
+        "log_device_placement": False,
+        "gpu_options": {
+            "visible_device_list": None,
+            "allow_growth": True,
         }
     },
     # Whether to LZ4 compress individual observations
@@ -563,6 +581,39 @@ class Trainer(Trainable):
                     self.config, {
                         "tf_session_args": self.
                         config["local_evaluator_tf_session_args"]
+                    }),
+                extra_config or {}))
+
+    @DeveloperAPI
+    def make_remote_opt_evaluator(self,
+                                  env_creator,
+                                  policy_graph,
+                                  index,
+                                  extra_config=None,
+                                  cls=PolicyEvaluator):
+        """Convenience method to return configured local evaluator."""
+
+        remote_args = {
+            "num_cpus": self.config["num_cpus_remote_opt"],
+            "num_gpus": self.config["num_gpus_remote_opt"],
+            "resources": self.config["custom_resources_remote_opt"],
+        }
+        remote_cls = cls.as_remote(**remote_args).remote
+
+        return self._make_evaluator(
+            remote_cls,
+            env_creator,
+            policy_graph,
+            # index should be unique, I guess; should probably be higher than
+            # local evaluator (0) and all remote evaluators (1, ...,
+            # num_evaluators).
+            index,
+            merge_dicts(
+                # important: allow local tf to use more CPUs for optimization
+                merge_dicts(
+                    self.config, {
+                        "tf_session_args": self.
+                        config["remote_opt_evaluator_tf_session_args"]
                     }),
                 extra_config or {}))
 
