@@ -137,8 +137,8 @@ DEFAULT_CONFIG = with_common_config({
     "min_iter_time_s": 1,
 
     # === GAIL hacks ===
-    # how many batches should we have to process learn on before pulling down
-    # new reward params?
+    # how many batches should we have to learn on before pulling down new
+    # reward params? (I suspect more frequent = better)
     "reward_update_freq": 20,
 })
 # __sphinx_doc_end__

@@ -271,12 +271,12 @@ def cfg():
         }
     }
     discrim_config = {  # noqa: F841
-        "lr": 1e-5,
+        "lr": 1e-3,
         "batch_size": 512,
         "updates_per_epoch": 50,
         # update shared weights at least once every time we take this many
         # steps
-        "sync_at_least_every": 25,
+        "sync_at_least_every": 100,
         "model": {
             "fcnet_hiddens": [256, 128],
             "fcnet_activation": "relu"

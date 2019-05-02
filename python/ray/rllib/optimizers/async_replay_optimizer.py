@@ -10,12 +10,11 @@ import collections
 import os
 import random
 import time
-import threading
 
 import numpy as np
-from six.moves import queue
 
 import ray
+from ray.experimental import named_actors
 from ray.rllib.evaluation.metrics import get_learner_stats
 from ray.rllib.evaluation.policy_evaluator import PolicyEvaluator
 from ray.rllib.evaluation.sample_batch import SampleBatch, DEFAULT_POLICY_ID, \
@@ -26,7 +25,6 @@ from ray.rllib.utils.annotations import override
 from ray.rllib.utils.actors import TaskPool, create_colocated
 from ray.rllib.utils.memory import ray_get_and_free
 from ray.rllib.utils.timer import TimerStat
-from ray.rllib.utils.window_stat import WindowStat
 
 SAMPLE_QUEUE_DEPTH = 2
 REPLAY_QUEUE_DEPTH = 4
@@ -126,7 +124,7 @@ class AsyncReplayOptimizer(PolicyOptimizer):
         # assert self.remote_evaluators is None, \
         #     "this should be set later on; my hacks only work with DQNTrainer"
         self.remote_opt_evaluator = None
-        self.learner_stats =None
+        self.learner_stats = None
 
     @override(PolicyOptimizer)
     def step(self):
@@ -136,18 +134,19 @@ class AsyncReplayOptimizer(PolicyOptimizer):
         time_delta = time.time() - start
         self.timers["sample"].push(time_delta)
         self.timers["sample"].push_units_processed(sample_timesteps)
-        if new_train_timesteps > 0:
-            self.learning_started = True
-        if self.learning_started \
-           and new_train_timesteps > self.num_steps_trained:
-            train_td = time.time() - self.last_num_steps_trained_time
-            self.timers["train"].push(train_td)
-            train_step_d = new_train_timesteps - self.num_steps_trained
-            self.timers["train"].push_units_processed(train_step_d)
-            self.last_num_steps_trained_time = time.time()
-            self.learner_stats = stats
         self.num_steps_sampled += sample_timesteps
-        self.num_steps_trained = new_train_timesteps
+        if new_train_timesteps is not None:
+            if new_train_timesteps > 0:
+                self.learning_started = True
+            if self.learning_started \
+               and new_train_timesteps > self.num_steps_trained:
+                train_td = time.time() - self.last_num_steps_trained_time
+                self.timers["train"].push(train_td)
+                train_step_d = new_train_timesteps - self.num_steps_trained
+                self.timers["train"].push_units_processed(train_step_d)
+                self.last_num_steps_trained_time = time.time()
+                self.learner_stats = stats
+            self.num_steps_trained = new_train_timesteps
 
     @override(PolicyOptimizer)
     def stop(self):
@@ -206,7 +205,6 @@ class AsyncReplayOptimizer(PolicyOptimizer):
 
     # For https://github.com/ray-project/ray/issues/2541 only
     def _set_evaluators(self, remote_evaluators, remote_opt_evaluator):
-        print("calling set_evaluators()")
         self.remote_evaluators = remote_evaluators
         weights = self.local_evaluator.get_weights()
         for ev in self.remote_evaluators:
@@ -224,6 +222,8 @@ class AsyncReplayOptimizer(PolicyOptimizer):
         sample_timesteps = 0
         weights = None
 
+        should_update = False
+
         with self.timers["sample_processing"]:
             completed = list(self.sample_tasks.completed())
             counts = ray_get_and_free([c[1][1] for c in completed])
@@ -238,31 +238,33 @@ class AsyncReplayOptimizer(PolicyOptimizer):
                     self.replay_actors).add_batch.remote(sample_batch)
 
                 # Update weights if needed
-                self.steps_since_update[ev] = counts[i]
+                self.steps_since_update[ev] += counts[i]
                 if self.steps_since_update[ev] >= self.max_weight_sync_delay:
                     # Note that it's important to pull new weights once
                     # updated to avoid excessive correlation between actors
-                    if weights is None or self.learner.weights_updated:
-                        self.learner.weights_updated = False
+                    if weights is None:  # or self.learner.weights_updated:
+                        # self.learner.weights_updated = False
                         with self.timers["put_weights"]:
                             weights = ray.put(
                                 self.local_evaluator.get_weights())
                     ev.set_weights.remote(weights)
                     self.num_weight_syncs += 1
                     self.steps_since_update[ev] = 0
+                    should_update = True
 
                 # Kick off another sample request
                 self.sample_tasks.add(ev, ev.sample_with_count.remote())
 
-        # we *always* pull weights from param server on every iteration; that
-        # helps ensure that we don't get too out of date (also the amount of
-        # compute done by this actor doesn't matter that much, since the actual
-        # learner is independent)
-        new_weights_h = self.param_server.get_weights.remote()
-        new_weights, new_train_timesteps, stats \
-            = ray_get_and_free(new_weights_h)
-        if new_weights is not None:
-            self.local_evaluator.set_weights(new_weights)
+        # regularly pull weights etc.
+        if should_update:
+            new_weights_h = self.param_server.get_weights.remote()
+            new_weights, new_train_timesteps, stats \
+                = ray_get_and_free(new_weights_h)
+            if new_weights is not None:
+                self.local_evaluator.set_weights(new_weights)
+        else:
+            new_train_timesteps = None
+            stats = None
 
         return sample_timesteps, new_train_timesteps, stats
 
@@ -500,42 +502,55 @@ class ApexLearnerEvaluator(PolicyEvaluator):
         self.__grad_timer = TimerStat()
         self.__stats = {}
         self.__train_timesteps = 0
-        self.__last_push_h = None
 
-    def do_apex_setup(self, weights, replay_workers, batch_size, param_server):
+    def do_apex_setup(self, weights, replay_workers, batch_size,
+                      policy_param_server):
         self.set_weights(weights)
         self.__replay_workers = replay_workers
         self.__batch_size = batch_size
         self.__sample_batcher = ReplayActorSampler(
             replay_workers, force=False, uniform=False)
-        self.__param_server = param_server
+        self.__pol_param_server = policy_param_server
+        self.__disc_param_server = None
         self.__last_push = 0
-        self._push_weights()
+        self._sync_weights()
 
-    def _push_weights(self):
-        if self.__last_push_h is not None:
-            # wait for last push to complete
-            ray.wait([self.__last_push_h])
-        self.__last_push_h = self.__param_server.set_weights.remote(
+    def _sync_weights(self):
+        # push policy parameters and fetch reward parameters
+        pol_h = self.__pol_param_server.set_weights.remote(
             self.get_weights(), self.__train_timesteps, self.__stats)
+        if self.__disc_param_server is None:
+            self.__disc_param_server \
+                = named_actors.get_actor("global_reward_params")
+        rew_h = self.__disc_param_server.get_weights.remote()
+        _, reward_weights = ray_get_and_free([pol_h, rew_h])
+        self.foreach_trainable_policy(
+            lambda p, _: p.set_reward_weights(reward_weights))
         self.__last_push = self.__train_timesteps
 
     def train_forever(self):
         """Train until the actor gets shut down."""
         while True:
-            samples, ra = self.__sample_batcher.get_batch()
-            if samples is not None:
-                prio_dict = {}
-                # with self.grad_timer:
-                grad_out = self.learn_on_batch(samples)
-                for pid, info in grad_out.items():
-                    prio_dict[pid] = (
-                        samples.policy_batches[pid].data.get(
-                            "batch_indexes"),
-                        info.get("td_error"))
-                    self.__stats[pid] = get_learner_stats(info)
-                ra.update_priorities.remote(prio_dict)
-                self.__train_timesteps += samples.total()
-                # TODO: make this push interval configurable
-                if self.__train_timesteps - self.__last_push >= 400:
-                    self._push_weights()
+            self._step()
+
+    def _step(self):
+        samples, ra = self.__sample_batcher.get_batch()
+        last_prio_h = None
+        if samples is not None:
+            prio_dict = {}
+            # with self.grad_timer:
+            grad_out = self.learn_on_batch(samples)
+            for pid, info in grad_out.items():
+                prio_dict[pid] = (
+                    samples.policy_batches[pid].data.get(
+                        "batch_indexes"),
+                    info.get("td_error"))
+                self.__stats[pid] = get_learner_stats(info)
+            if last_prio_h is not None:
+                ray_get_and_free(last_prio_h)
+                last_prio_h = None
+            last_prio_h = ra.update_priorities.remote(prio_dict)
+            self.__train_timesteps += samples.total()
+            # TODO: make this push interval configurable
+            if self.__train_timesteps - self.__last_push >= 400:
+                self._sync_weights()
