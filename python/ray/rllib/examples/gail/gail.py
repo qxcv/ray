@@ -252,7 +252,7 @@ def load_latest_demos(demo_dir):
 @ex.config
 def cfg():
     env_name = 'InvertedPendulum-v2'  # noqa: F841
-    max_time_s = 3600  # noqa: F841
+    max_time_s = 1800  # noqa: F841
     # TensorFlow configurations
     tf_configs = {  # noqa: F841
         "discrim": {
@@ -276,7 +276,7 @@ def cfg():
         "updates_per_epoch": 50,
         # update shared weights at least once every time we take this many
         # steps
-        "sync_at_least_every": 100,
+        "sync_at_least_every": 400,
         "model": {
             "fcnet_hiddens": [256, 128],
             "fcnet_activation": "relu"
@@ -291,7 +291,7 @@ def cfg():
         "output_timesteps": 10000,
     }
     td3_conf = {  # noqa: F841
-        "evaluation_interval": 5,
+        "evaluation_interval": 2,
         "evaluation_num_episodes": 5,
         "timesteps_per_iteration": 5000,
         "min_iter_time_s": 30,

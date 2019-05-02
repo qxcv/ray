@@ -1,6 +1,4 @@
 data_dir: data
-discrim_config:
-  updates_per_epoch: 50
 env_name: HalfCheetah-v2
 expert_config:
   expert_subdir: demos
