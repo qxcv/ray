@@ -1,13 +1,7 @@
 """A distributed implementation of GAIL using the TD3 optimizer with APE-X."""
 
-import collections
 import os
 import time
-
-# TODO: add a check to make sure these are at correct value; warn or error out
-# if not
-# os.environ["MKL_NUM_THREADS"] = str(1)
-# os.environ["OMP_NUM_THREADS"] = str(1)
 
 import gym  # noqa: E402
 
@@ -22,10 +16,9 @@ from ray.rllib.evaluation.sample_batch import SampleBatch  # noqa: E402
 from ray.rllib.offline.json_writer import JsonWriter  # noqa: E402
 from ray.rllib.offline.json_reader import JsonReader  # noqa: E402
 from ray.rllib.optimizers.async_replay_optimizer \
-    import REPLAY_QUEUE_DEPTH, ReplayActorSampler  # noqa: E402
+    import ReplayActorSampler  # noqa: E402
 from ray.rllib.models import ModelCatalog  # noqa: E402
 from ray.rllib.utils.memory import ray_get_and_free  # noqa: E402
-from ray.rllib.utils.actors import TaskPool  # noqa: E402
 from ray.tune.logger import CSVLogger, pretty_print  # noqa: E402
 from ray.tune.util import merge_dicts  # noqa: E402
 
@@ -39,8 +32,16 @@ ex = Experiment('gail')
 
 # @ray.remote(num_cpus=1, num_gpus=1)
 class DiscriminatorActor(object):
-    def __init__(self, env_name, disc_config, expert_config, td3_conf,
-                 tf_par_args, param_server, replay_actors):
+    def __init__(self,
+                 env_name,
+                 disc_config,
+                 expert_config,
+                 td3_conf,
+                 tf_par_args,
+                 param_server,
+                 replay_actors=None,
+                 not_actor=False,
+                 optimizer=None):
         env = gym.make(env_name)
         self.discriminator = Discriminator(disc_config, env.observation_space,
                                            env.action_space)
@@ -66,11 +67,19 @@ class DiscriminatorActor(object):
         self.reward_vars = ray.experimental.tf_utils.TensorFlowVariables(
             self.discriminator.reward, self.sess)
 
-        self.replay_sampler = ReplayActorSampler(
-            replay_actors,
-            # use 1/2 of real batch size b/c when training discrim we mix with
-            # and other 1/2 expert samples
-            batch_size=self.half_batch_size)
+        self.not_actor = not_actor
+        if not_actor:
+            # this was not started as an actor; we need to sample from a real
+            # replay buffer
+            assert optimizer is not None
+            self.optimizer = optimizer
+        else:
+            assert replay_actors is not None
+            self.replay_sampler = ReplayActorSampler(
+                replay_actors,
+                # use 1/2 of real batch size b/c when training discrim we mix
+                # with and other 1/2 expert samples
+                batch_size=self.half_batch_size)
 
     def train_epoch(self):
         """Train for at least num_steps or until min_time has elapsed,
@@ -93,27 +102,49 @@ class DiscriminatorActor(object):
             "disc_samples_seen": self.disc_samples_seen,
         }
 
+    def train_step_sync(self, push=False):
+        """Train for a single step & then synchronise waits; useful for
+        synchronous training without workers, etc."""
+        disc_loss, disc_acc = self._train_step()
+        if push:
+            self.push_weights(sync=True)
+        return {
+            "disc_loss": disc_loss,
+            "disc_acc": disc_acc,
+            "disc_updates": self.disc_updates,
+            "disc_samples_seen": self.disc_samples_seen,
+        }
+
     def get_reward_weights(self):
         return self.reward_vars.get_weights()
 
-    def push_weights(self):
+    def push_weights(self, sync=False):
         if self._wait_handle is not None:
             # wait for previous request to finish
             ray_get_and_free(self._wait_handle)
             self._wait_handle = None
         # launch a new push asynchronously
         weights = self.get_reward_weights()
-        self._wait_handle = self.param_server.set_weights.remote(weights)
+        handle = self.param_server.set_weights.remote(weights)
+        if sync:
+            ray_get_and_free(handle)
+        else:
+            self._wait_handle = handle
 
     def _train_step(self):
-        ma_batch, _ = self.replay_sampler.get_batch()
-        if not ma_batch.policy_batches:
-            # sometimes this happens at the beginning of training b/c
-            # there are not enough samples in the replay buffer
-            return 0.0, 0.0
-        fake_batch = ma_batch.policy_batches["default_policy"]
-        fake_obs_batch = fake_batch['obs']
-        fake_act_batch = fake_batch['actions']
+        if self.not_actor:
+            replay_buffer, = self.optimizer.replay_buffers.values()
+            fake_obs_batch, fake_act_batch, _, _, _ \
+                = replay_buffer.sample_uniform(self.half_batch_size)
+        else:
+            ma_batch, _ = self.replay_sampler.get_batch()
+            if not ma_batch.policy_batches:
+                # sometimes this happens at the beginning of training b/c
+                # there are not enough samples in the replay buffer
+                return 0.0, 0.0
+            fake_batch = ma_batch.policy_batches["default_policy"]
+            fake_obs_batch = fake_batch['obs']
+            fake_act_batch = fake_batch['actions']
         real_batch_inds = np.random.choice(self.ds_range,
                                            size=(self.half_batch_size, ))
         label_batch = np.zeros((2 * self.half_batch_size, ))
@@ -157,7 +188,7 @@ class DiscriminatorParameterServer(object):
 
 
 # @ray.remote(num_cpus=1)
-class TrainerActor(object):
+class AsyncTrainerActor(object):
     def __init__(self, env_name, td3_conf):
         self.trainer = ApexTD3Trainer(env=env_name, config=td3_conf)
 
@@ -166,6 +197,10 @@ class TrainerActor(object):
 
     def train_epoch(self):
         return self.trainer.train()
+
+    def step(self):
+        raise NotImplementedError(
+            "Call .train_epoch() instead when using AsyncTrainerActor")
 
 
 class Discriminator(object):
@@ -249,10 +284,24 @@ def load_latest_demos(demo_dir):
     return demos
 
 
+def repeat_seconds(function, seconds):
+    """Call `function` at least once, and then keep calling it until `seconds`
+    have elapsed. Return last result."""
+    start = time.time()
+    rv = function()
+    while time.time() - start < seconds:
+        rv = function()
+    return rv
+
+
 @ex.config
 def cfg():
     env_name = 'InvertedPendulum-v2'  # noqa: F841
     max_time_s = 3600  # noqa: F841
+    # synchronous coordination; forces it to alternate between trajectory
+    # sampling, and policy optimisation, and discriminator optimisation (forces
+    # td3_conf.num_workers to 0)
+    sync_coord = False  # noqa: F841
     # TensorFlow configurations
     tf_configs = {  # noqa: F841
         "discrim": {
@@ -333,13 +382,20 @@ def make_tf_config_args(tf_threads=None, gpu_num=None):
 
 @ex.main
 def main(env_name, discrim_config, expert_config, full_data_dir, tf_configs,
-         td3_conf, max_time_s, _config, _run):
+         td3_conf, max_time_s, sync_coord, _config, _run):
     """Run GAIL on a given environment. Assumes that you've already used
     train_expert to collect expert demos for the environment."""
     out_dir = os.path.join(full_data_dir, "gail_run_%s" % _run._id)
     os.makedirs(out_dir, exist_ok=True)
     stat_logger = CSVLogger(config=_config, logdir=out_dir)
-    ray.init(num_cpus=38, num_gpus=2)
+    num_gpus = sum(d["gpu_num"] is not None for d in tf_configs.values())
+    if num_gpus == 0:
+        # make doubly-sure that nothing can get at GPUs
+        print("No GPUs, trying to disable")
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    else:
+        print("Allocating %d GPUs for Ray" % num_gpus)
+    ray.init(num_cpus=38, num_gpus=num_gpus)
     ropt_num_gpus = int(
         tf_configs["td3_remote_learner"]["gpu_num"] is not None)
     # algo config dict
@@ -349,6 +405,7 @@ def main(env_name, discrim_config, expert_config, full_data_dir, tf_configs,
         # buffer code) is responsible for making actual optimiser steps
         "remote_opt_evaluator_tf_session_args": make_tf_config_args(
             **tf_configs["td3_remote_learner"]),
+        "prioritized_replay": True,
         "num_gpus_remote_opt": ropt_num_gpus,
         # this is used by all the rollout evaluators & anything else that gets
         # instantiated
@@ -359,37 +416,71 @@ def main(env_name, discrim_config, expert_config, full_data_dir, tf_configs,
     td3_conf = merge_dicts(td3_base_conf, td3_conf)
     disc_param_server = DiscriminatorParameterServer.remote()
     named_actors.register_actor("global_reward_params", disc_param_server)
-    TA = ray.remote(num_cpus=1, num_gpus=0)(TrainerActor)
-    trainer_actor = TA.remote(env_name, td3_conf)
-    replay_actors_handle = trainer_actor.get_replay_actors.remote()
-    DA = ray.remote(num_cpus=1,
-                    num_gpus=1 if tf_configs["discrim"]["gpu_num"] is not None
-                    else 0)(DiscriminatorActor)
-    discrim_actor = DA.remote(env_name, discrim_config, expert_config,
-                              td3_conf,
-                              make_tf_config_args(**tf_configs["discrim"]),
-                              disc_param_server, replay_actors_handle)
+    if sync_coord:
+        trainer_object = TD3Trainer(env=env_name, config=td3_conf)
+        discrim_object = DiscriminatorActor(
+            env_name,
+            discrim_config,
+            expert_config,
+            td3_conf,
+            make_tf_config_args(**tf_configs["discrim"]),
+            disc_param_server,
+            not_actor=True,
+            optimizer=trainer_object.optimizer)
+    else:
+        TA = ray.remote(num_cpus=1, num_gpus=0)(AsyncTrainerActor)
+        trainer_actor = TA.remote(env_name, td3_conf)
+        replay_actors_handle = trainer_actor.get_replay_actors.remote()
+        num_gpus_disc = int(tf_configs["discrim"]["gpu_num"] is not None)
+        DA = ray.remote(num_cpus=1, num_gpus=num_gpus_disc)(DiscriminatorActor)
+        discrim_actor = DA.remote(env_name,
+                                  discrim_config,
+                                  expert_config,
+                                  td3_conf,
+                                  make_tf_config_args(**tf_configs["discrim"]),
+                                  disc_param_server,
+                                  replay_actors=replay_actors_handle)
 
     itr = 0
     start_time = time.time()
+    last_print = -999999.0
+    prev_steps_trained = 0
     while time.time() - start_time < max_time_s:
-        # train for a little while
-        trainer_handle = trainer_actor.train_epoch.remote()
-        discrim_handle = discrim_actor.train_epoch.remote()
-        trainer_result, discrim_result = ray_get_and_free(
-            [trainer_handle, discrim_handle])
+        if sync_coord:
+            trainer_result = trainer_object.train()
+            num_steps_trained = trainer_result['info']['num_steps_trained']
+            steps_delta = num_steps_trained - prev_steps_trained
+            disc_repeats = int(steps_delta / td3_conf["train_batch_size"])
+            prev_steps_trained = num_steps_trained
+            if disc_repeats == 0:
+                # just train a fair bit if we're still in exploration phase
+                disc_repeats = 100
+            for i in range(disc_repeats):
+                discrim_result = discrim_object.train_step_sync()
+            discrim_object.push_weights(sync=True)
+        else:
+            # train for a little while
+            trainer_handle = trainer_actor.train_epoch.remote()
+            discrim_handle = discrim_actor.train_epoch.remote()
+            trainer_result, discrim_result = ray_get_and_free(
+                [trainer_handle, discrim_handle])
+
         full_result = merge_dicts(trainer_result, discrim_result)
         del full_result["config"]
 
-        # end of epoch, print stats
-        print('Epoch %d:' % itr)
-        print("  {}".format(pretty_print(full_result).replace("\n", "\n  ")))
+        # end of epoch, print stats (at most 1 per 5 seconds when doing
+        # synchronous stuff)
+        if not sync_coord or time.time() - last_print > 5.0:
+            last_print = time.time()
+            print('Epoch %d:' % itr)
+            print("  {}".format(
+                pretty_print(full_result).replace("\n", "\n  ")))
 
-        # also store in file
-        stat_logger.on_result(full_result)
-        # TODO: do this less often b/c each call has O(T) cost (it actually
-        # copies the whole stats file)
-        _run.add_artifact(stat_logger._file.name)
+            # also store in file
+            stat_logger.on_result(full_result)
+            # TODO: do this less often b/c each call has O(T) cost (it actually
+            # copies the whole stats file)
+            _run.add_artifact(stat_logger._file.name)
 
         # next epoch!
         itr += 1
