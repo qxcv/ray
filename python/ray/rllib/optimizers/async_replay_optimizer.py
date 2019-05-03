@@ -552,5 +552,5 @@ class ApexLearnerEvaluator(PolicyEvaluator):
             last_prio_h = ra.update_priorities.remote(prio_dict)
             self.__train_timesteps += samples.total()
             # TODO: make this push interval configurable
-            if self.__train_timesteps - self.__last_push >= 400:
+            if self.__train_timesteps - self.__last_push >= 800:
                 self._sync_weights()
