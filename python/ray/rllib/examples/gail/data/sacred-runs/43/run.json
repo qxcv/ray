@@ -1,0 +1,121 @@
+{
+  "artifacts": [
+    "progress.csv",
+    "progress.csv",
+    "progress.csv",
+    "progress.csv",
+    "progress.csv",
+    "progress.csv",
+    "progress.csv",
+    "progress.csv",
+    "progress.csv",
+    "progress.csv",
+    "progress.csv",
+    "progress.csv",
+    "progress.csv",
+    "progress.csv",
+    "progress.csv",
+    "progress.csv",
+    "progress.csv",
+    "progress.csv",
+    "progress.csv",
+    "progress.csv",
+    "progress.csv",
+    "progress.csv",
+    "progress.csv",
+    "progress.csv"
+  ],
+  "command": "main",
+  "experiment": {
+    "base_dir": "/home/sam/repos/ray/python/ray/rllib/examples/gail",
+    "dependencies": [
+      "gym==0.12.1",
+      "numpy==1.16.3",
+      "ray==0.7.0.dev3",
+      "sacred==0.7.4-onurgu",
+      "tensorflow-gpu==1.13.1"
+    ],
+    "mainfile": "gail.py",
+    "name": "gail",
+    "repositories": [],
+    "sources": [
+      [
+        "gail.py",
+        "_sources/gail_26c63b884ebf0f4d4a6e94c6a738b69b.py"
+      ]
+    ]
+  },
+  "heartbeat": "2019-05-02T06:08:24.579083",
+  "host": {
+    "ENV": {},
+    "cpu": "Intel(R) Xeon(R) Gold 6130 CPU @ 2.10GHz",
+    "gpus": {
+      "driver_version": "418.40.04",
+      "gpus": [
+        {
+          "model": "GeForce GTX 1080 Ti",
+          "persistence_mode": true,
+          "total_memory": 11178
+        },
+        {
+          "model": "GeForce GTX 1080 Ti",
+          "persistence_mode": true,
+          "total_memory": 11178
+        },
+        {
+          "model": "GeForce GTX 1080 Ti",
+          "persistence_mode": true,
+          "total_memory": 11178
+        },
+        {
+          "model": "GeForce GTX 1080 Ti",
+          "persistence_mode": true,
+          "total_memory": 11177
+        }
+      ]
+    },
+    "hostname": "perceptron",
+    "os": [
+      "Linux",
+      "Linux-4.15.0-47-generic-x86_64-with-Ubuntu-18.04-bionic"
+    ],
+    "python_version": "3.6.7"
+  },
+  "meta": {
+    "command": "main",
+    "options": {
+      "--beat_interval": null,
+      "--capture": null,
+      "--comment": null,
+      "--debug": false,
+      "--enforce_clean": false,
+      "--file_storage": null,
+      "--force": false,
+      "--help": false,
+      "--loglevel": null,
+      "--mongo_db": null,
+      "--name": null,
+      "--pdb": false,
+      "--print_config": false,
+      "--priority": null,
+      "--queue": false,
+      "--sql": null,
+      "--tiny_db": null,
+      "--unobserved": false,
+      "COMMAND": null,
+      "UPDATE": [
+        "halfcheetah-full-nogpu.yaml",
+        "td3_conf.pure_exploration_steps=0",
+        "td3_conf.learning_starts=0",
+        "max_time_s=900"
+      ],
+      "help": false,
+      "with": true
+    }
+  },
+  "resources": [],
+  "result": null,
+  "start_time": "2019-05-02T05:52:53.273623",
+  "status": "COMPLETED",
+  "stop_time": "2019-05-02T06:08:24.572983"
+}
